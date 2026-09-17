@@ -1,6 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context;
+use futures::StreamExt;
 use k8s_openapi::api::core::v1::{
     CSIPersistentVolumeSource, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
     ObjectReference, PersistentVolume, PersistentVolumeClaim, PersistentVolumeSpec,
@@ -8,6 +11,11 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::api::{Api, DeleteParams, ListParams, PostParams};
+use kube::runtime::watcher;
+use kube::Client;
+
+use crate::base::{is_base_referenced, overlay_lowerdirs, Store};
 
 pub const PV_PREFIX: &str = "overlayfs-";
 pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
@@ -86,6 +94,203 @@ pub fn build_pv(
         }),
         ..Default::default()
     })
+}
+
+pub const GC_GRACE_S: u64 = 300;
+const RECONCILE_INTERVAL_S: u64 = 30;
+
+pub fn is_orphan(dir_name: &str, managed: &HashSet<String>, dir_age_s: u64) -> bool {
+    !managed.contains(dir_name) && dir_age_s > GC_GRACE_S
+}
+
+pub struct Controller {
+    pub kube: Client,
+    pub store: Arc<Store>,
+    pub storage_class: String,
+    pub node: String,
+    pub driver_name: String,
+    pub max_age_s: i64,
+}
+
+impl Controller {
+    pub async fn run(&self) -> anyhow::Result<()> {
+        let pvcs: Api<PersistentVolumeClaim> = Api::all(self.kube.clone());
+        let mut events = watcher(pvcs, watcher::Config::default()).boxed();
+        let mut reconciler =
+            tokio::time::interval(std::time::Duration::from_secs(RECONCILE_INTERVAL_S));
+        let mut janitor =
+            tokio::time::interval(std::time::Duration::from_secs(RECONCILE_INTERVAL_S));
+        loop {
+            tokio::select! {
+                ev = events.next() => match ev {
+                    Some(Ok(watcher::Event::Applied(pvc))) => {
+                        if let Err(e) = self.handle_pvc(&pvc).await {
+                            tracing::error!(pvc = ?pvc.metadata.name, "provision failed: {e:#}");
+                        }
+                    }
+                    Some(Ok(watcher::Event::Deleted(pvc))) => {
+                        if let Err(e) = self.handle_pvc_deleted(&pvc).await {
+                            tracing::error!(pvc = ?pvc.metadata.name, "cleanup of deleted PVC failed: {e:#}");
+                        }
+                    }
+                    Some(Ok(watcher::Event::Restarted(pvcs))) => {
+                        for pvc in &pvcs {
+                            if let Err(e) = self.handle_pvc(pvc).await {
+                                tracing::error!(pvc = ?pvc.metadata.name, "reconcile-provision failed: {e:#}");
+                            }
+                        }
+                    }
+                    Some(Err(e)) => tracing::error!("PVC watch error (kube_runtime will reconnect): {e}"),
+                    None => anyhow::bail!("PVC watch stream ended unexpectedly"),
+                },
+                _ = reconciler.tick() => {
+                    let pvcs: Api<PersistentVolumeClaim> = Api::all(self.kube.clone());
+                    match pvcs.list(&ListParams::default()).await {
+                        Ok(list) => {
+                            for pvc in &list.items {
+                                if let Err(e) = self.handle_pvc(pvc).await {
+                                    tracing::error!(pvc = ?pvc.metadata.name, "reconcile failed: {e:#}");
+                                }
+                            }
+                        }
+                        Err(e) => tracing::error!("reconcile list failed: {e}"),
+                    }
+                },
+                _ = janitor.tick() => {
+                    if let Err(e) = self.cleanup_once().await {
+                        tracing::error!("cleanup/GC failed: {e:#}");
+                    }
+                },
+            }
+        }
+    }
+
+    pub async fn handle_pvc(&self, pvc: &PersistentVolumeClaim) -> anyhow::Result<()> {
+        if !should_provision(pvc, &self.storage_class, &self.node) {
+            return Ok(());
+        }
+        let uid = pvc.metadata.uid.as_deref().context("PVC uid missing")?;
+        let name = pv_name(uid);
+        let vdir = self.store.volume_dir(&name);
+        tracing::info!(%name, dir = %vdir.display(), "provisioning volume");
+        std::fs::create_dir_all(&vdir)?; // 幂等：多实例/重放安全
+
+        let pv = build_pv(pvc, &self.node, &self.driver_name)?;
+        let pvs: Api<PersistentVolume> = Api::all(self.kube.clone());
+        match pvs.create(&PostParams::default(), &pv).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(e)) if e.reason == "AlreadyExists" => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn handle_pvc_deleted(&self, pvc: &PersistentVolumeClaim) -> anyhow::Result<()> {
+        let uid = pvc
+            .metadata
+            .uid
+            .as_deref()
+            .context("deleted PVC has no uid")?;
+        let name = pv_name(uid);
+        let pvs: Api<PersistentVolume> = Api::all(self.kube.clone());
+        match pvs.delete(&name, &DeleteParams::default()).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.reason == "NotFound" => {}
+            Err(e) => return Err(e.into()),
+        }
+        // 数据目录只存在于 selected-node；其他实例自然找不到
+        let vdir = self.store.volume_dir(&name);
+        if vdir.exists() {
+            tracing::info!(%name, dir = %vdir.display(), "removing released volume directory");
+            std::fs::remove_dir_all(&vdir)?;
+        }
+        let wdir = self.store.work_dir(&name);
+        if wdir.exists() {
+            std::fs::remove_dir_all(&wdir)?;
+        }
+        Ok(())
+    }
+
+    pub async fn cleanup_once(&self) -> anyhow::Result<()> {
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
+        // 0 个 overlay 意味着 mountinfo 格式漂移：引用检查将静默放行，
+        // 过期 base 会被误删 —— 立即告警暴露。
+        if overlay_lowerdirs(&mountinfo).is_empty() {
+            tracing::warn!(
+                "parsed 0 overlay mounts from mountinfo; base-reference checks will silently pass"
+            );
+        }
+        // 1. base TTL 清理：被 overlay 引用的不删
+        for base in self.store.list_bases()? {
+            if base.valid(self.max_age_s) {
+                continue;
+            }
+            if is_base_referenced(&mountinfo, &base.0) {
+                tracing::debug!(base = %base.0.display(), "expired base still referenced, keeping");
+                continue;
+            }
+            tracing::warn!(base = %base.0.display(), "removing expired base");
+            std::fs::remove_dir_all(&base.0)?;
+        }
+        // 2. 孤儿 volumes/ GC
+        let pvs: Api<PersistentVolume> = Api::all(self.kube.clone());
+        let list = pvs
+            .list(&ListParams::default().labels(&format!("{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}")))
+            .await?;
+        let managed: HashSet<String> = list
+            .items
+            .iter()
+            .filter_map(|pv| Some(pv.spec.as_ref()?.csi.as_ref()?.volume_handle.clone()))
+            .collect();
+        self.gc_orphans(&self.store.volumes_dir(), &managed, &mountinfo)?;
+        // 3. 孤儿 work/ GC：对应 volume 目录不存在即孤儿（挂载中的 staging 必然有 volume 目录）
+        let work_root = self.store.root.join("work");
+        if work_root.exists() {
+            for entry in std::fs::read_dir(&work_root)?.filter_map(Result::ok) {
+                let vid = entry.file_name().to_string_lossy().to_string();
+                if self.store.volume_dir(&vid).exists() {
+                    continue;
+                }
+                let age = dir_age_s(&entry.path())?;
+                if is_orphan(&format!("work/{vid}"), &HashSet::new(), age) {
+                    tracing::warn!(dir = %entry.path().display(), "removing orphaned work dir");
+                    std::fs::remove_dir_all(entry.path())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn gc_orphans(
+        &self,
+        dir: &Path,
+        managed: &HashSet<String>,
+        mountinfo: &str,
+    ) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(dir)?.filter_map(Result::ok) {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if managed.contains(&name) {
+                continue;
+            }
+            if is_base_referenced(mountinfo, &path) {
+                continue;
+            }
+            let age = dir_age_s(&path)?;
+            if !is_orphan(&name, managed, age) {
+                continue;
+            }
+            tracing::warn!(dir = %path.display(), "removing orphaned volume directory");
+            std::fs::remove_dir_all(&path)?;
+        }
+        Ok(())
+    }
+}
+
+fn dir_age_s(path: &Path) -> anyhow::Result<u64> {
+    let meta = std::fs::metadata(path)?;
+    let modified = meta.modified()?;
+    let age = std::time::SystemTime::now().duration_since(modified)?;
+    Ok(age.as_secs())
 }
 
 #[cfg(test)]
@@ -190,5 +395,15 @@ status:
         assert_eq!(req.key, "metadata.name");
         assert_eq!(req.operator, "In");
         assert_eq!(req.values.as_ref().unwrap(), &vec!["node1".to_string()]);
+    }
+
+    #[test]
+    fn orphan_detection_logic() {
+        let mut managed = std::collections::HashSet::new();
+        managed.insert("overlayfs-u1".to_string());
+        // 有对应 PV → 非孤儿；无 PV 但太新（grace 内）→ 非孤儿；无 PV 且超 grace → 孤儿
+        assert!(!is_orphan("overlayfs-u1", &managed, 0));
+        assert!(!is_orphan("overlayfs-u9", &managed, 10));
+        assert!(is_orphan("overlayfs-u9", &managed, 10_000));
     }
 }
