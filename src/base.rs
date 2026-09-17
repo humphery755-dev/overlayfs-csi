@@ -105,6 +105,14 @@ pub fn is_base_referenced(mountinfo: &str, base: &Path) -> bool {
         .any(|(_, dirs)| dirs.iter().any(|d| d == base))
 }
 
+/// lowerdir[0] of the overlay mount at `mountpoint`, if any.
+pub fn mounted_lower_for(mountinfo: &str, mountpoint: &str) -> Option<PathBuf> {
+    overlay_lowerdirs(mountinfo)
+        .into_iter()
+        .find(|(mp, _)| mp == mountpoint)
+        .and_then(|(_, dirs)| dirs.into_iter().next())
+}
+
 pub fn mount_overlay(
     id: &str,
     lower: &Path,
@@ -169,6 +177,9 @@ pub fn promote_to_base_with_mount(
             format!("{}/", dst.display())
         )
         .run()?;
+        // cp -a 会把源数据目录里的 `.as_base` 标记（0 字节）覆盖进 dst，
+        // 导致时间戳不可解析、base 永久失效、随后被 TTL janitor 误删 —— 拷贝完成后重写。
+        Base(dst.clone()).write_time()?;
         Ok(())
     })();
     match result {
@@ -263,6 +274,29 @@ mod tests {
         assert!(!is_base_referenced(MOUNTINFO, Path::new("/bases/nope")));
     }
 
+    #[test]
+    fn mounted_lower_for_returns_overlay_lower() {
+        assert_eq!(
+            mounted_lower_for(MOUNTINFO, "/mnt/host"),
+            Some(PathBuf::from("/var/lib/overlayfs-csi/bases/abc"))
+        );
+        assert_eq!(
+            mounted_lower_for(MOUNTINFO, "/mnt/host/data"),
+            Some(PathBuf::from("/other/base"))
+        );
+    }
+
+    #[test]
+    fn mounted_lower_for_rejects_bind_and_unknown() {
+        let bind = "40 36 0:43 / /mnt/staging rw - ext4 /dev/sda1 rw\n";
+        assert_eq!(
+            mounted_lower_for(bind, "/mnt/staging"),
+            None,
+            "bind 挂载没有 lowerdir，语义等同无旧 base"
+        );
+        assert_eq!(mounted_lower_for(MOUNTINFO, "/mnt/absent"), None);
+    }
+
     /// 非 root 环境自动 skip（集成测试需要真实 mount）。
     fn require_root() -> bool {
         let ok = std::process::Command::new("id")
@@ -348,19 +382,26 @@ mod tests {
 
     #[test]
     fn promote_without_base_copies_volume() {
-        if !require_root() {
-            return;
-        }
+        // 纯 fs + cp，无 mount，非 root 可跑
         let dir = std::env::temp_dir().join(format!("ofcsi-promote2-{}", std::process::id()));
         let store = Store::new(&dir);
         std::fs::create_dir_all(store.bases_dir()).unwrap();
         let vdir = store.volume_dir("v2");
         std::fs::create_dir_all(&vdir).unwrap();
         std::fs::write(vdir.join("f"), "1").unwrap();
+        // 源数据目录里的用户标记（0 字节）：cp -a 必须不能让它覆盖固化时间戳
+        std::fs::write(vdir.join(AS_BASE_FILENAME), "").unwrap();
 
         let dst = promote_to_base_with_mount(&store, &vdir, "nb2").unwrap();
         assert_eq!(std::fs::read_to_string(dst.join("f")).unwrap(), "1");
         assert!(dst.join(AS_BASE_FILENAME).exists());
+        let t = Base(dst.clone())
+            .read_time()
+            .expect("0 字节标记绝不能作为固化时间戳存活（base 会永久失效被 janitor 删）");
+        assert!(
+            (OffsetDateTime::now_utc() - t).whole_seconds() < 3600,
+            "固化后的时间戳必须新鲜（1h 内）"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

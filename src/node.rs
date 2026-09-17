@@ -73,6 +73,13 @@ impl v1::node_server::Node for NodeService {
         let req = req.into_inner();
         let staging = req.staging_target_path;
         tracing::info!(volume_id = %req.volume_id, %staging, "unstaging volume");
+        // umount 前读 mountinfo：staging 若是 overlay，其 lowerdir（旧 base）必须并入本次固化。
+        // 注意旧 base 的 TTL 可能已过期——固化条件由 stage_overlay_decision 单独评估，
+        // 但它的内容仍属于新 base。此处 .ok() 是约定的上下文读取：mountinfo/挂载缺失
+        // 即无 lower，与 bind-stage 卷语义一致（None → 直接拷贝）。
+        let mounted_lower = std::fs::read_to_string("/proc/self/mountinfo")
+            .ok()
+            .and_then(|mi| base::mounted_lower_for(&mi, &staging));
         base::umount_idempotent(Path::new(&staging)).map_err(|e| {
             tracing::error!(volume_id = %req.volume_id, "unstage umount failed: {e:#}");
             Status::internal(format!("unstage failed: {e:#}"))
@@ -91,7 +98,7 @@ impl v1::node_server::Node for NodeService {
                 None => {
                     let new_id = uuid::Uuid::new_v4().to_string();
                     tracing::info!(volume_id = %req.volume_id, base_id = %new_id, "promoting volume to base");
-                    self.promote(&req.volume_id, &vdir, &new_id, decision.clone())
+                    self.promote(&req.volume_id, &vdir, &new_id, mounted_lower.map(base::Base))
                         .map_err(|e| {
                             tracing::error!("promote failed: {e:#}");
                             Status::internal(format!("base promotion failed: {e:#}"))
@@ -184,6 +191,8 @@ impl v1::node_server::Node for NodeService {
 impl NodeService {
     /// 固化：有旧 base → overlay ro 合并视图；无 → 数据目录即完整视图。
     /// `lower` 由调用方评估后传入：固化路径内不得重新评估 stage 决策（TOCTOU）。
+    /// lower 来自 staging 挂载在 mountinfo 中的记录（可能已过 TTL；
+    /// 其内容仍属于新 base，必须并入合并视图）。
     fn promote(
         &self,
         volume_id: &str,
