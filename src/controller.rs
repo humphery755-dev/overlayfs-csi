@@ -168,6 +168,10 @@ status:
         );
         assert_eq!(spec.persistent_volume_reclaim_policy.as_deref(), Some("Delete"));
         assert_eq!(spec.storage_class_name, None, "预绑定 PV 不设 storageClassName");
+        assert_eq!(
+            spec.access_modes.as_ref().map(|v| v.as_slice()),
+            Some(&["ReadWriteOnce".to_string()][..])
+        );
         let claim = spec.claim_ref.as_ref().unwrap();
         assert_eq!(claim.name.as_deref(), Some("demo"));
         assert_eq!(claim.namespace.as_deref(), Some("default"));
@@ -184,6 +188,7 @@ status:
         let terms = &spec.node_affinity.as_ref().unwrap().required.as_ref().unwrap().node_selector_terms;
         let req = terms[0].match_fields.as_ref().unwrap()[0].clone();
         assert_eq!(req.key, "metadata.name");
+        assert_eq!(req.operator, "In");
         assert_eq!(req.values.as_ref().unwrap(), &vec!["node1".to_string()]);
     }
 }
