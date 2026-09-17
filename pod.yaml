@@ -1,9 +1,20 @@
 # 持久卷示例：独立 PVC + 引用它的 Pod。
+#
+# ── 长期停机后数据不丢的操作约定 ─────────────────────────────
+# PVC 是数据的唯一锚点：数据目录跟随 PVC 存活，与 Pod 无关。
+#   删除 Pod：      kubectl delete pod test        （PVC 保留，数据保留）
+#   停机任意久后恢复：kubectl apply -f pod.yaml     （同名 PVC 复用，数据回粘）
+# 禁止：kubectl delete -f pod.yaml —— 会连 PVC 一起删除，
+#       PV 随之回收，数据目录被 GC 清理，数据不可恢复。
+#
+# ── 节点选择 ───────────────────────────────────────────────
 # StorageClass 为 WaitForFirstConsumer：Pod 被调度后，调度器把选中节点写进
 # volume.kubernetes.io/selected-node 注解，该节点的驱动实例供给卷并把 PV 的
-# nodeAffinity 锁定在那里——之后该 PVC 的所有 Pod 都会被调度回同一节点。
-# 因此无需 nodeName 手动固定；如确需指定节点，添加 spec.nodeName 即可。
-# namespace 与 chart 默认部署位置（kube-system）一致，按需调整。
+# nodeAffinity 锁定在那里——之后该 PVC 的所有 Pod（包括停机数月后重建的）
+# 都会被调度回同一节点。无需 nodeName；如确需指定，添加 spec.nodeName。
+#
+# ── namespace ──────────────────────────────────────────────
+# 与 chart 默认部署位置（kube-system）一致，按需调整。
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

@@ -5,5 +5,9 @@ name: overlayfs.csi.k8s.io
 storageClassName: ""
 # Host path root for bases/volumes/work
 storageRoot: /var/lib/overlayfs-csi
-# Maximum age of a base before cleaning it up
-maxAgeSeconds: 86400
+# Maximum age of a base before cleaning it up.
+# PVC 数据（用户变更）不依赖此值——它随 PVC 永久保留。
+# 此值决定「停机后重建 Pod 时，启动环境的完整视图」能回粘多久：
+# 需要停机 N 天后仍拿到完整环境（base + 变更），就把此值设为大于 N 天。
+# 86400=1 天；2592000=30 天（下例）。
+maxAgeSeconds: 2592000

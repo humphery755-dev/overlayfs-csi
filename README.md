@@ -48,7 +48,7 @@ This repository also provides an example for building Kubernetes CSIs in Rust.
 
   - TODO: This could be replaced by a check on the pod exit status.
 
-- Bases carry a creation timestamp and expire after `--max-age-s` (86400 s by default). Expired bases are cleaned up in the background unless an overlay mount still references them. When this results in no base being available, the next volume simply starts from scratch (until some volume is promoted again).
+- Bases carry a creation timestamp and expire after `--max-age-s` (2592000 s, i.e. 30 days, by default). Expired bases are cleaned up in the background unless an overlay mount still references them. When this results in no base being available, the next volume simply starts from scratch (until some volume is promoted again).
 
 ### Underlying storage
 
@@ -104,6 +104,17 @@ To test the deployment, apply [`pod.yaml`](pod.yaml), which creates a PVC and a 
    ```
    Writes go to the volume's own data directory only. A base — if one exists — is never modified, and no untouched file is copied.
 4. Once the pod from step 2 was deleted, its `.as_base` marker caused the volume to be frozen into a new base on unstage (assuming no valid base existed). A _new_ PVC created afterwards starts as an overlay on top of it and therefore already contains `hello`.
+
+### Shutting down for a long time (days to months)
+
+The same example survives arbitrarily long downtime — only the pod is deleted, the PVC (and with it the data directory on the node) stays:
+
+```
+$ kubectl delete pod test        # pod only — never `kubectl delete -f pod.yaml`, that would delete the PVC too
+$ kubectl apply -f pod.yaml      # days later: same PVC reused, all changes are still there
+```
+
+`maxAgeSeconds` controls how long the _full_ environment (base + your changes) re-attaches after downtime; PVC data itself does not depend on it. Set it larger than your expected downtime interval (see [`chart/values.yaml`](chart/values.yaml)).
 
 ## Implementation details
 
