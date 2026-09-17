@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -15,7 +15,7 @@ use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use kube::runtime::watcher;
 use kube::Client;
 
-use crate::base::{is_base_referenced, overlay_lowerdirs, Store};
+use crate::base::{is_referenced_in, overlay_lowerdirs, remove_dir_all_if_exists, Store};
 
 pub const PV_PREFIX: &str = "overlayfs-";
 pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
@@ -99,10 +99,7 @@ pub fn build_pv(
 pub const GC_GRACE_S: u64 = 300;
 const RECONCILE_INTERVAL_S: u64 = 30;
 
-pub fn is_orphan(dir_name: &str, managed: &HashSet<String>, dir_age_s: u64) -> bool {
-    !managed.contains(dir_name) && dir_age_s > GC_GRACE_S
-}
-
+#[derive(Clone)]
 pub struct Controller {
     pub kube: Client,
     pub store: Arc<Store>,
@@ -114,12 +111,33 @@ pub struct Controller {
 
 impl Controller {
     pub async fn run(&self) -> anyhow::Result<()> {
+        // janitor 独立任务：删除数 GB 目录（remove_dir_all）时不得阻塞 watch 事件
+        // 处理（Applied 事件延迟 = provision 延迟）。
+        tokio::spawn({
+            let this = self.clone();
+            async move {
+                let mut janitor = tokio::time::interval_at(
+                    tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(RECONCILE_INTERVAL_S),
+                    std::time::Duration::from_secs(RECONCILE_INTERVAL_S),
+                );
+                loop {
+                    janitor.tick().await;
+                    if let Err(e) = this.cleanup_once().await {
+                        tracing::error!("cleanup/GC failed: {e:#}");
+                    }
+                }
+            }
+        });
+
         let pvcs: Api<PersistentVolumeClaim> = Api::all(self.kube.clone());
         let mut events = watcher(pvcs, watcher::Config::default()).boxed();
-        let mut reconciler =
-            tokio::time::interval(std::time::Duration::from_secs(RECONCILE_INTERVAL_S));
-        let mut janitor =
-            tokio::time::interval(std::time::Duration::from_secs(RECONCILE_INTERVAL_S));
+        // 首个 tick 延后一个周期：启动状态由 watcher 的 Restarted 重放覆盖，
+        // 避免 t=0 时同一批 PVC 被全量处理两次。
+        let mut reconciler = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(RECONCILE_INTERVAL_S),
+            std::time::Duration::from_secs(RECONCILE_INTERVAL_S),
+        );
         loop {
             tokio::select! {
                 ev = events.next() => match ev {
@@ -154,11 +172,6 @@ impl Controller {
                             }
                         }
                         Err(e) => tracing::error!("reconcile list failed: {e}"),
-                    }
-                },
-                _ = janitor.tick() => {
-                    if let Err(e) = self.cleanup_once().await {
-                        tracing::error!("cleanup/GC failed: {e:#}");
                     }
                 },
             }
@@ -203,35 +216,35 @@ impl Controller {
             tracing::info!(%name, dir = %vdir.display(), "removing released volume directory");
             std::fs::remove_dir_all(&vdir)?;
         }
-        let wdir = self.store.work_dir(&name);
-        if wdir.exists() {
-            std::fs::remove_dir_all(&wdir)?;
-        }
+        remove_dir_all_if_exists(&self.store.work_dir(&name))?;
         Ok(())
     }
 
     pub async fn cleanup_once(&self) -> anyhow::Result<()> {
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
-        // 0 个 overlay 意味着 mountinfo 格式漂移：引用检查将静默放行，
-        // 过期 base 会被误删 —— 立即告警暴露。
-        if overlay_lowerdirs(&mountinfo).is_empty() {
+        // 同一份 mountinfo 本轮只解析一次，全部引用检查复用解析结果。
+        let mounts = overlay_lowerdirs(&mountinfo);
+        // 0 个 overlay 意味着 mountinfo 格式漂移或节点状态异常：引用检查将静默放行，
+        // 过期 base 会被误删（README 承诺被引用的删除一律跳过）——本轮整体跳过并告警。
+        if mounts.is_empty() {
             tracing::warn!(
-                "parsed 0 overlay mounts from mountinfo; base-reference checks will silently pass"
+                "parsed 0 overlay mounts from mountinfo; skipping this cleanup round"
             );
+            return Ok(());
         }
         // 1. base TTL 清理：被 overlay 引用的不删
         for base in self.store.list_bases()? {
             if base.valid(self.max_age_s) {
                 continue;
             }
-            if is_base_referenced(&mountinfo, &base.0) {
+            if is_referenced_in(&mounts, &base.0) {
                 tracing::debug!(base = %base.0.display(), "expired base still referenced, keeping");
                 continue;
             }
             tracing::warn!(base = %base.0.display(), "removing expired base");
             std::fs::remove_dir_all(&base.0)?;
         }
-        // 2. 孤儿 volumes/ GC
+        // 2. 孤儿 volumes/ GC：保留条件 = managed 集合中有对应 volume_handle
         let pvs: Api<PersistentVolume> = Api::all(self.kube.clone());
         let list = pvs
             .list(&ListParams::default().labels(&format!("{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}")))
@@ -241,47 +254,38 @@ impl Controller {
             .iter()
             .filter_map(|pv| Some(pv.spec.as_ref()?.csi.as_ref()?.volume_handle.clone()))
             .collect();
-        self.gc_orphans(&self.store.volumes_dir(), &managed, &mountinfo)?;
-        // 3. 孤儿 work/ GC：对应 volume 目录不存在即孤儿（挂载中的 staging 必然有 volume 目录）
-        let work_root = self.store.root.join("work");
+        self.gc_orphans(&self.store.volumes_dir(), &mounts, &|n| managed.contains(n))?;
+        // 3. 孤儿 work/ GC：保留条件 = 对应 volume 目录仍存在（挂载中的 staging 必然有 volume 目录）
+        let work_root = self.store.work_root();
         if work_root.exists() {
-            for entry in std::fs::read_dir(&work_root)? {
-                let entry = entry?;
-                let vid = entry.file_name().to_string_lossy().to_string();
-                if self.store.volume_dir(&vid).exists() {
-                    continue;
-                }
-                let age = dir_age_s(&entry.path())?;
-                if is_orphan(&format!("work/{vid}"), &HashSet::new(), age) {
-                    tracing::warn!(dir = %entry.path().display(), "removing orphaned work dir");
-                    std::fs::remove_dir_all(entry.path())?;
-                }
-            }
+            self.gc_orphans(&work_root, &mounts, &|n| self.store.volume_dir(n).exists())?;
         }
         Ok(())
     }
 
+    /// 统一孤儿清理：保留条件由调用方以 `keep` 谓词注入（volumes 看 PV 集合、
+    /// work 看兄弟 volume 目录），grace 与 mountinfo 引用检查为共享逻辑。
     fn gc_orphans(
         &self,
         dir: &Path,
-        managed: &HashSet<String>,
-        mountinfo: &str,
+        mounts: &[(String, Vec<PathBuf>)],
+        keep: &dyn Fn(&str) -> bool,
     ) -> anyhow::Result<()> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if managed.contains(&name) {
+            if keep(&name) {
                 continue;
             }
-            if is_base_referenced(mountinfo, &path) {
+            // 廉价检查在前：grace 内的目录不做引用表扫描
+            if dir_age_s(&path)? <= GC_GRACE_S {
                 continue;
             }
-            let age = dir_age_s(&path)?;
-            if !is_orphan(&name, managed, age) {
+            if is_referenced_in(mounts, &path) {
                 continue;
             }
-            tracing::warn!(dir = %path.display(), "removing orphaned volume directory");
+            tracing::warn!(dir = %path.display(), "removing orphaned directory");
             std::fs::remove_dir_all(&path)?;
         }
         Ok(())
@@ -394,15 +398,5 @@ status:
         assert_eq!(req.key, "metadata.name");
         assert_eq!(req.operator, "In");
         assert_eq!(req.values.as_ref().unwrap(), &vec!["node1".to_string()]);
-    }
-
-    #[test]
-    fn orphan_detection_logic() {
-        let mut managed = std::collections::HashSet::new();
-        managed.insert("overlayfs-u1".to_string());
-        // 有对应 PV → 非孤儿；无 PV 但太新（grace 内）→ 非孤儿；无 PV 且超 grace → 孤儿
-        assert!(!is_orphan("overlayfs-u1", &managed, 0));
-        assert!(!is_orphan("overlayfs-u9", &managed, 10));
-        assert!(is_orphan("overlayfs-u9", &managed, 10_000));
     }
 }

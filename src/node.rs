@@ -6,11 +6,7 @@ use tonic::{Request, Response, Status};
 use crate::base::{self, Base, Store};
 use crate::v1;
 
-/// stage 决策：返回 Some(base) 表示 overlay stage，None 表示 bind mount。
-pub fn stage_overlay_decision(store: &Store, max_age_s: i64) -> anyhow::Result<Option<Base>> {
-    store.find_valid_base(max_age_s)
-}
-
+#[derive(Clone)]
 pub struct NodeService {
     pub node_id: String,
     pub store: Arc<Store>,
@@ -19,6 +15,19 @@ pub struct NodeService {
 
 fn unimplemented() -> Status {
     Status::unimplemented("Unimplemented")
+}
+
+/// io/anyhow 错误 → internal Status（无日志，用于预期内失败如缺目录）。
+fn internal<E: Into<anyhow::Error>>(e: E) -> Status {
+    Status::internal(e.into().to_string())
+}
+
+/// 带卷上下文的操作错误：记 ERROR 日志并转为 internal Status。
+fn logged<'a>(op: &'static str, volume_id: &'a str) -> impl Fn(anyhow::Error) -> Status + 'a {
+    move |e| {
+        tracing::error!(volume_id, "{op} failed: {e:#}");
+        Status::internal(format!("{op} failed: {e:#}"))
+    }
 }
 
 // tonic 服务契约：返回 Result<_, Status>；Status 体积由 tonic 定义，非本层可缩小
@@ -47,8 +56,8 @@ impl v1::node_server::Node for NodeService {
         tracing::info!(volume_id = %req.volume_id, %staging, "staging volume");
         let vdir = volume_dir_checked(&req.volume_id, &self.store)?;
         let work = self.store.work_dir(&req.volume_id);
-        std::fs::create_dir_all(&work).map_err(|e| Status::internal(e.to_string()))?;
-        let result = match stage_overlay_decision(&self.store, self.max_age_s) {
+        std::fs::create_dir_all(&work).map_err(internal)?;
+        let result = match self.store.find_valid_base(self.max_age_s) {
             Ok(Some(base)) => {
                 tracing::info!(base = %base.0.display(), "staging as overlay");
                 base::mount_overlay(&req.volume_id, &base.0, &vdir, &work, false, Path::new(&staging))
@@ -59,10 +68,7 @@ impl v1::node_server::Node for NodeService {
             }
             Err(e) => Err(e),
         };
-        result.map_err(|e| {
-            tracing::error!(volume_id = %req.volume_id, "stage failed: {e:#}");
-            Status::internal(format!("stage failed: {e:#}"))
-        })?;
+        result.map_err(logged("stage", &req.volume_id))?;
         Ok(Response::new(Default::default()))
     }
 
@@ -74,16 +80,16 @@ impl v1::node_server::Node for NodeService {
         let staging = req.staging_target_path;
         tracing::info!(volume_id = %req.volume_id, %staging, "unstaging volume");
         // umount 前读 mountinfo：staging 若是 overlay，其 lowerdir（旧 base）必须并入本次固化。
-        // 注意旧 base 的 TTL 可能已过期——固化条件由 stage_overlay_decision 单独评估，
+        // 注意旧 base 的 TTL 可能已过期——固化条件由 find_valid_base 单独评估，
         // 但它的内容仍属于新 base。此处 .ok() 是约定的上下文读取：mountinfo/挂载缺失
         // 即无 lower，与 bind-stage 卷语义一致（None → 直接拷贝）。
-        let mounted_lower = std::fs::read_to_string("/proc/self/mountinfo")
+        let mounts = std::fs::read_to_string("/proc/self/mountinfo")
             .ok()
-            .and_then(|mi| base::mounted_lower_for(&mi, &staging));
-        base::umount_idempotent(Path::new(&staging)).map_err(|e| {
-            tracing::error!(volume_id = %req.volume_id, "unstage umount failed: {e:#}");
-            Status::internal(format!("unstage failed: {e:#}"))
-        })?;
+            .map(|mi| base::overlay_lowerdirs(&mi));
+        let mounted_lower = mounts
+            .as_deref()
+            .and_then(|m| base::mounted_lower_in(m, &staging));
+        base::umount_idempotent(Path::new(&staging)).map_err(logged("unstage umount", &req.volume_id))?;
 
         // base 固化：upper 中有 .as_base 且当前无有效 base（spec 规则）
         let vdir = self.store.volume_dir(&req.volume_id);
@@ -92,27 +98,34 @@ impl v1::node_server::Node for NodeService {
             // TOCTOU：stage 决策只评估一次，promote 复用同一结果。
             // 若 promote 内部重新评估，并发 unstage 可能在间隙固化出新 base，
             // 导致把别的 volume 数据合并进本次固化结果。
-            let decision = stage_overlay_decision(&self.store, self.max_age_s)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            match &decision {
+            let decision = self
+                .store
+                .find_valid_base(self.max_age_s)
+                .map_err(internal)?;
+            match decision {
                 None => {
                     let new_id = uuid::Uuid::new_v4().to_string();
                     tracing::info!(volume_id = %req.volume_id, base_id = %new_id, "promoting volume to base");
-                    self.promote(&req.volume_id, &vdir, &new_id, mounted_lower.map(base::Base))
-                        .map_err(|e| {
-                            tracing::error!("promote failed: {e:#}");
-                            Status::internal(format!("base promotion failed: {e:#}"))
-                        })?;
-                    std::fs::remove_file(&marker).map_err(|e| Status::internal(e.to_string()))?;
+                    // cp 可能分钟级（无 reflink 的文件系统）：放阻塞线程池，
+                    // 不占用 async worker。
+                    let this = self.clone();
+                    let vid = req.volume_id.clone();
+                    let vdir = vdir.clone();
+                    let lower = mounted_lower.map(base::Base);
+                    tokio::task::spawn_blocking(move || {
+                        this.promote(&vid, &vdir, &new_id, lower)
+                    })
+                    .await
+                    .map_err(|e| Status::internal(format!("promote task aborted: {e}")))?
+                    .map_err(logged("base promotion", &req.volume_id))?;
+                    std::fs::remove_file(&marker).map_err(internal)?;
                 }
                 Some(_) => tracing::info!("valid base exists, skipping promotion"),
             }
         }
         // work 目录回收
         let work = self.store.work_dir(&req.volume_id);
-        if work.exists() {
-            std::fs::remove_dir_all(&work).map_err(|e| Status::internal(e.to_string()))?;
-        }
+        base::remove_dir_all_if_exists(&work).map_err(internal)?;
         Ok(Response::new(Default::default()))
     }
 
@@ -124,11 +137,9 @@ impl v1::node_server::Node for NodeService {
         let target = req.target_path;
         let staging = req.staging_target_path;
         tracing::info!(volume_id = %req.volume_id, %target, %staging, "publishing volume");
-        std::fs::create_dir_all(&target).map_err(|e| Status::internal(e.to_string()))?;
-        base::mount_bind(Path::new(&staging), Path::new(&target)).map_err(|e| {
-            tracing::error!("publish failed: {e:#}");
-            Status::internal(format!("publish failed: {e:#}"))
-        })?;
+        std::fs::create_dir_all(&target).map_err(internal)?;
+        base::mount_bind(Path::new(&staging), Path::new(&target))
+            .map_err(logged("publish", &req.volume_id))?;
         Ok(Response::new(Default::default()))
     }
 
@@ -139,10 +150,7 @@ impl v1::node_server::Node for NodeService {
         let req = req.into_inner();
         let target = req.target_path;
         tracing::info!(volume_id = %req.volume_id, %target, "unpublishing volume");
-        base::umount_idempotent(Path::new(&target)).map_err(|e| {
-            tracing::error!("unpublish failed: {e:#}");
-            Status::internal(format!("unpublish failed: {e:#}"))
-        })?;
+        base::umount_idempotent(Path::new(&target)).map_err(logged("unpublish", &req.volume_id))?;
         Ok(Response::new(Default::default()))
     }
 
@@ -206,17 +214,17 @@ impl NodeService {
                 std::fs::create_dir_all(&merged)?;
                 let work = self.store.work_dir(volume_id);
                 std::fs::create_dir_all(&work)?;
-                let mounted = base::mount_overlay(
-                    &format!("promote-{new_id}"),
-                    &b.0,
-                    vdir,
-                    &work,
-                    true,
-                    &merged,
-                );
-                let outcome = mounted.and_then(|()| {
+                let outcome = (|| {
+                    base::mount_overlay(
+                        &format!("promote-{new_id}"),
+                        &b.0,
+                        vdir,
+                        &work,
+                        true,
+                        &merged,
+                    )?;
                     base::promote_to_base_with_mount(&self.store, &merged, new_id)
-                });
+                })();
                 let um = base::umount_idempotent(&merged);
                 std::fs::remove_dir_all(&merged)?;
                 um?;
@@ -339,7 +347,7 @@ mod tests {
     use crate::base::AS_BASE_FILENAME;
 
     #[test]
-    fn decision_returns_valid_base_only() {
+    fn find_valid_base_returns_only_valid() {
         let dir = std::env::temp_dir().join(format!("ofcsi-node-{}", std::process::id()));
         let store = Store::new(&dir);
         std::fs::create_dir_all(store.bases_dir()).unwrap();
@@ -351,12 +359,12 @@ mod tests {
             "2020-01-01T00:00:00.000000000Z",
         )
         .unwrap();
-        assert_eq!(stage_overlay_decision(&store, 3600).unwrap(), None);
+        assert_eq!(store.find_valid_base(3600).unwrap(), None);
         // 新鲜 base → overlay
         let fresh = store.bases_dir().join("fresh");
         std::fs::create_dir_all(&fresh).unwrap();
         Base(fresh.clone()).write_time().unwrap();
-        assert_eq!(stage_overlay_decision(&store, 3600).unwrap(), Some(Base(fresh)));
+        assert_eq!(store.find_valid_base(3600).unwrap(), Some(Base(fresh)));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

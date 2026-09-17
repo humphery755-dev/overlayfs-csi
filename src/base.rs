@@ -58,12 +58,15 @@ impl Store {
     pub fn volume_dir(&self, volume_id: &str) -> PathBuf {
         self.volumes_dir().join(volume_id)
     }
+    pub fn work_root(&self) -> PathBuf {
+        self.root.join("work")
+    }
     pub fn work_dir(&self, volume_id: &str) -> PathBuf {
-        self.root.join("work").join(volume_id)
+        self.work_root().join(volume_id)
     }
     /// Create the storage-root subtrees (idempotent); call once at startup.
     pub fn init(&self) -> anyhow::Result<()> {
-        for d in [self.bases_dir(), self.volumes_dir(), self.root.join("work")] {
+        for d in [self.bases_dir(), self.volumes_dir(), self.work_root()] {
             std::fs::create_dir_all(d)?;
         }
         Ok(())
@@ -106,18 +109,28 @@ pub fn overlay_lowerdirs(mountinfo: &str) -> Vec<(String, Vec<PathBuf>)> {
 }
 
 /// Whether any overlay mount's lowerdir points at `base`.
-pub fn is_base_referenced(mountinfo: &str, base: &Path) -> bool {
-    overlay_lowerdirs(mountinfo)
+/// 入参为 [`overlay_lowerdirs`] 的解析结果：同一份 mountinfo 只解析一次，
+/// 供本轮 cleanup 的全部引用检查复用。
+pub fn is_referenced_in(mounts: &[(String, Vec<PathBuf>)], base: &Path) -> bool {
+    mounts
         .iter()
         .any(|(_, dirs)| dirs.iter().any(|d| d == base))
 }
 
 /// lowerdir[0] of the overlay mount at `mountpoint`, if any.
-pub fn mounted_lower_for(mountinfo: &str, mountpoint: &str) -> Option<PathBuf> {
-    overlay_lowerdirs(mountinfo)
-        .into_iter()
+pub fn mounted_lower_in(mounts: &[(String, Vec<PathBuf>)], mountpoint: &str) -> Option<PathBuf> {
+    mounts
+        .iter()
         .find(|(mp, _)| mp == mountpoint)
-        .and_then(|(_, dirs)| dirs.into_iter().next())
+        .and_then(|(_, dirs)| dirs.first().cloned())
+}
+
+/// 删除目录（若存在）；不存在视为成功（幂等清理惯例，调用点不再各写 exists 守卫）。
+pub fn remove_dir_all_if_exists(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        std::fs::remove_dir_all(path)?;
+    }
+    Ok(())
 }
 
 pub fn mount_overlay(
@@ -230,7 +243,7 @@ mod tests {
         let store = Store::new(&dir);
         store.init().unwrap();
         store.init().unwrap(); // 二次 init 必须幂等成功
-        for d in [store.bases_dir(), store.volumes_dir(), store.root.join("work")] {
+        for d in [store.bases_dir(), store.volumes_dir(), store.work_root()] {
             assert!(d.is_dir(), "{} 必须存在", d.display());
         }
         std::fs::remove_dir_all(&dir).unwrap();
@@ -287,34 +300,38 @@ mod tests {
 
     #[test]
     fn detects_base_reference() {
-        assert!(is_base_referenced(
-            MOUNTINFO,
+        let mounts = overlay_lowerdirs(MOUNTINFO);
+        assert!(is_referenced_in(
+            &mounts,
             Path::new("/var/lib/overlayfs-csi/bases/abc")
         ));
-        assert!(!is_base_referenced(MOUNTINFO, Path::new("/bases/nope")));
+        assert!(!is_referenced_in(&mounts, Path::new("/bases/nope")));
     }
 
     #[test]
-    fn mounted_lower_for_returns_overlay_lower() {
+    fn mounted_lower_in_returns_overlay_lower() {
+        let mounts = overlay_lowerdirs(MOUNTINFO);
         assert_eq!(
-            mounted_lower_for(MOUNTINFO, "/mnt/host"),
+            mounted_lower_in(&mounts, "/mnt/host"),
             Some(PathBuf::from("/var/lib/overlayfs-csi/bases/abc"))
         );
         assert_eq!(
-            mounted_lower_for(MOUNTINFO, "/mnt/host/data"),
+            mounted_lower_in(&mounts, "/mnt/host/data"),
             Some(PathBuf::from("/other/base"))
         );
     }
 
     #[test]
-    fn mounted_lower_for_rejects_bind_and_unknown() {
-        let bind = "40 36 0:43 / /mnt/staging rw - ext4 /dev/sda1 rw\n";
+    fn mounted_lower_in_rejects_bind_and_unknown() {
+        let mounts = overlay_lowerdirs(
+            "40 36 0:43 / /mnt/staging rw - ext4 /dev/sda1 rw\n",
+        );
         assert_eq!(
-            mounted_lower_for(bind, "/mnt/staging"),
+            mounted_lower_in(&mounts, "/mnt/staging"),
             None,
             "bind 挂载没有 lowerdir，语义等同无旧 base"
         );
-        assert_eq!(mounted_lower_for(MOUNTINFO, "/mnt/absent"), None);
+        assert_eq!(mounted_lower_in(&mounts, "/mnt/absent"), None);
     }
 
     /// 非 root 环境自动 skip（集成测试需要真实 mount）。
