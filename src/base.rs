@@ -61,9 +61,16 @@ impl Store {
     pub fn work_dir(&self, volume_id: &str) -> PathBuf {
         self.root.join("work").join(volume_id)
     }
+    /// Create the storage-root subtrees (idempotent); call once at startup.
+    pub fn init(&self) -> anyhow::Result<()> {
+        for d in [self.bases_dir(), self.volumes_dir(), self.root.join("work")] {
+            std::fs::create_dir_all(d)?;
+        }
+        Ok(())
+    }
     pub fn list_bases(&self) -> anyhow::Result<Vec<Base>> {
         let mut bases = Vec::new();
-        for entry in std::fs::read_dir(&self.bases_dir())? {
+        for entry in std::fs::read_dir(self.bases_dir())? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 bases.push(Base(entry.path()));
@@ -214,6 +221,19 @@ mod tests {
             PathBuf::from("/var/lib/overlayfs-csi/volumes/v1")
         );
         assert_eq!(s.work_dir("v1"), PathBuf::from("/var/lib/overlayfs-csi/work/v1"));
+    }
+
+    #[test]
+    fn init_creates_storage_subtrees_idempotently() {
+        // 冷节点：bases/、volumes/、work/ 尚不存在是预期状态，非系统错误
+        let dir = std::env::temp_dir().join(format!("ofcsi-init-{}", std::process::id()));
+        let store = Store::new(&dir);
+        store.init().unwrap();
+        store.init().unwrap(); // 二次 init 必须幂等成功
+        for d in [store.bases_dir(), store.volumes_dir(), store.root.join("work")] {
+            assert!(d.is_dir(), "{} 必须存在", d.display());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

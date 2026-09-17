@@ -54,6 +54,8 @@ impl v1::identity_server::Identity for IdentityService {
 async fn main_impl(args: Flags) -> anyhow::Result<()> {
     let overlay = args.overlay;
     let store = Arc::new(overlayfs_csi::base::Store::new(overlay.bases.clone()));
+    // 冷节点子树初始化：启动即建，失败即 crash（配置/环境问题不拖到运行期才暴露）
+    store.init()?;
 
     info!("Connecting to Kubernetes API");
     let kube_client = kube::Client::try_default().await?;

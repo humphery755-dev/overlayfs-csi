@@ -375,10 +375,7 @@ status:
         );
         assert_eq!(spec.persistent_volume_reclaim_policy.as_deref(), Some("Delete"));
         assert_eq!(spec.storage_class_name, None, "预绑定 PV 不设 storageClassName");
-        assert_eq!(
-            spec.access_modes.as_ref().map(|v| v.as_slice()),
-            Some(&["ReadWriteOnce".to_string()][..])
-        );
+        assert_eq!(spec.access_modes.as_deref(), Some(&["ReadWriteOnce".to_string()][..]));
         let claim = spec.claim_ref.as_ref().unwrap();
         assert_eq!(claim.name.as_deref(), Some("demo"));
         assert_eq!(claim.namespace.as_deref(), Some("default"));
