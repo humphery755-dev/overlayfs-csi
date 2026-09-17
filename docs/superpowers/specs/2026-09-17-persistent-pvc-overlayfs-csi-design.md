@@ -40,8 +40,9 @@ hostPath 根目录 `/var/lib/overlayfs-csi/`（`DirectoryOrCreate`），取代�
 
 | RPC | 现状 | 新设计 |
 |---|---|---|
-| `ControllerCreateVolume` / `ControllerDeleteVolume` | 无 | 新增（自实现，PVC watcher 驱动） |
-| `ControllerGetCapabilities` | 无 | 声明 `CREATE_VOLUME`、`DELETE_VOLUME` |
+| `ControllerCreateVolume` | 无 | 新增能力声明（实际供给由 PVC watcher 驱动，见「创建」节；RPC 本身返回 Unimplemented——自实现模式下无调用方） |
+| `ControllerDeleteVolume` | 无 | 返回 Unimplemented——PV 回收的 CSI Delete 调用方是 external-provisioner，本设计无 sidecar，删除完全由 PVC watcher 驱动（见「删除」节） |
+| `ControllerGetCapabilities` | 无 | 仅声明 `CREATE_VOLUME`（不声明 `DELETE_VOLUME`：该 RPC 无调用方，声明即死代码） |
 | `NodeStageVolume` | Unimplemented | overlay（有 base）或 bind（无 base）挂数据目录到 staging |
 | `NodePublishVolume` | 直接 overlay 到 target | bind staging → target（标准两段式） |
 | `NodeUnstageVolume` | Unimplemented | umount staging；检测 `.as_base` 固化 base |
@@ -56,7 +57,7 @@ Identity 服务不变。
 
 PVC watcher（kube watch，断线自动重连；每 30s 全量 reconcile 兜底）：
 
-1. 过滤：pending PVC 且 `storageClassName` 属于本 driver 的 StorageClass；
+1. 过滤：pending PVC 且 `spec.storageClassName` 等于 `--storage-class` flag 值（chart values 配置，默认与 driver name 相同）；
 2. `selected-node == 本节点` 时：
    - `mkdir -p /var/lib/overlayfs-csi/volumes/{volume-id}`（幂等）；
    - 创建 PV `overlayfs-<pvc-uid>`：csi 源、capacity 取 PVC `requests.storage`、`claimRef` 预绑定、`nodeAffinity` 锁定本节点、`persistentVolumeReclaimPolicy: Delete`；
@@ -76,7 +77,7 @@ PVC watcher（kube watch，断线自动重连；每 30s 全量 reconcile 兜底�
   3. **固化开始时即写 `.as_base` 时间戳**（防 TTL cleanup 误删固化中的 base），umount 临时点，删除数据目录内 `.as_base` 防重复固化；
   4. 任一步失败 → 删除半成品目录回滚，标记保留待重试。
 
-语义：`apt install` 成果在 PVC 中天然持久；`.as_base` 额外把环境固化为后续新 PVC 的起点（增量构建缓存价值保留）。
+语义：`apt install` 成果在 PVC 中天然持久；`.as_base` 额外把环境固化为后续新 PVC 的起点（增量构建缓存价值保留）。固化后数据目录与新 base 内容重复：叠加语义正确（upper 优先），空间双份属预期代价，随 PVC 删除回收。
 
 ### 删除
 
@@ -93,7 +94,7 @@ PVC `Deleted` 事件 → API 删除对应 PV（自建 PV 无自定义 finalizer�
 | provision 步骤失败 | ERROR 日志 + 重试队列；30s reconcile 再触发 | ERROR |
 | stage/publish 失败 | `internal` status 上抛，kubelet 重试；无 fallback | ERROR |
 | base 固化中途失败 | 删半成品回滚，`.as_base` 保留 | ERROR |
-| driver 宕机期间 PVC 删除 → 孤儿 `volumes/`、`work/` | 孤儿 GC：周期扫描，无对应 PV 且无 mountinfo 引用即删 | WARN |
+| driver 宕机期间 PVC 删除 → 孤儿 `volumes/`、`work/` | 孤儿 GC：周期扫描本节点目录，`list PV`（按 `overlayfs-` 前缀过滤，RBAC 已有）无对应对象且无 mountinfo 引用即删 | WARN |
 | watch 断线 | kube-rs 重连 + 30s reconcile | WARN |
 
 ## 竞态与边界
@@ -116,7 +117,8 @@ PVC `Deleted` 事件 → API 删除对应 PV（自建 PV 无自定义 finalizer�
 
 - `csi.yaml`：driver 容器新增 hostPath `/var/lib/overlayfs-csi`（替代 bases emptyDir）与 `/var/lib/kubelet/plugins`（Bidirectional，staging path 位于 plugins 下）；RBAC 瘦身——删除 `pods` 全部权限及 `nodes`/`volumeattachments`/`csinodes`/`snapshot`/`storageclasses`/`events` 残留，保留 `persistentvolumes: [get,list,watch,create,delete]`、`persistentvolumeclaims: [get,list,watch]`；`CSIDriver.volumeLifecycleModes: [Persistent]`；
 - 新增 StorageClass：`provisioner: overlayfs.csi.k8s.io`、`volumeBindingMode: WaitForFirstConsumer`、`reclaimPolicy: Delete`；
-- `values.yaml`：新增存储根路径等项；
+- driver args 变更：`--bases` 语义改为 hostPath 存储根 `/var/lib/overlayfs-csi`；删除 `--pods`、`--size-limit`、`POD_ID` env（blank pod 机制整体移除）；新增 `--storage-class`；
+- `values.yaml`：新增存储根路径、StorageClass 名等项；
 - 删除 `data_pod.yaml`；`pod.yaml` 改为「独立 PVC + pod 挂载」示例；README 同步。
 
 ## 测试
