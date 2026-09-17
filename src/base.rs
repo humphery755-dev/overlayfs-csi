@@ -132,7 +132,10 @@ pub fn mount_bind(src: &Path, mountpoint: &Path) -> anyhow::Result<()> {
 }
 
 pub fn umount_idempotent(mountpoint: &Path) -> anyhow::Result<()> {
-    let out = duct::cmd!("umount", mountpoint).unchecked().run()?;
+    let out = duct::cmd!("umount", mountpoint)
+        .stderr_capture()
+        .unchecked()
+        .run()?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let not_mounted = stderr.contains("not mounted")
@@ -321,7 +324,8 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
         let merged = dir.join("merged");
         std::fs::create_dir_all(&merged).unwrap();
-        mount_overlay("t2", &base_dir, &vdir, &work, true, &merged).unwrap();
+        // 测试用 rw 挂载：需要通过合并视图删除文件以制造 whiteout（ro 挂载会 EROFS）
+        mount_overlay("t2", &base_dir, &vdir, &work, false, &merged).unwrap();
 
         // 在合并视图里制造 whiteout：删除 old-file
         std::fs::remove_file(merged.join("old-file")).unwrap();
