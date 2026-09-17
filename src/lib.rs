@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 use tracing::*;
 
 pub mod base;
+pub mod controller;
 
 const BASE_CLEANUP_FREQ_S: u64 = 30;
 
