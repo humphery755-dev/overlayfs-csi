@@ -86,7 +86,7 @@ spec:
             - "--name={{ .Values.name }}"
             - "--bases={{ .Values.storageRoot }}"
             - "--storage-class={{ .Values.storageClassName | default .Values.name }}"
-            - "--max-age-s={{ .Values.maxAgeSeconds }}"
+            - "--max-age-s={{ .Values.maxAgeSeconds | int }}"
           env:
             - name: KUBE_NODE_NAME
               valueFrom:
