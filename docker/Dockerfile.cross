@@ -1,0 +1,12 @@
+# Cross-compilation image: preloaded with protoc 25.1 (static binary).
+# protoc is pre-downloaded on the host (container cannot reach github.com over TLS),
+# so the image build requires no network access.
+# PROTOC/PROTOC_INCLUDE are consumed by prost-build (config.rs): it runs $PROTOC
+# with an extra -I $PROTOC_INCLUDE so csi.proto can import the well-known types.
+FROM ghcr.io/cross-rs/x86_64-unknown-linux-gnu:0.2.5
+
+COPY docker/protoc-usr/bin/protoc /usr/local/bin/protoc
+COPY docker/protoc-usr/include/ /usr/include/
+
+ENV PROTOC=/usr/local/bin/protoc \
+    PROTOC_INCLUDE=/usr/include

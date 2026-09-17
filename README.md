@@ -70,6 +70,14 @@ It would be fairly easy to support arbitrary volume types. For CSIs that support
    $ docker build -t overlayfs-csi .
    ```
 
+   The build downloads `csi.proto` and needs a protobuf compiler. With `cross`, [`Cross.toml`](Cross.toml) points at [`docker/Dockerfile.cross`](docker/Dockerfile.cross), a builder image with protoc 25.1 preinstalled (useful offline: place the protoc tarball contents under `docker/protoc-usr/` first). For a plain `cargo build` on the host, point the toolchain at a protoc yourself:
+
+   ```
+   $ export PROTOC=/usr/local/bin/protoc PROTOC_INCLUDE=/usr/include   # system protoc
+   # or reuse the vendored one:
+   $ export PROTOC=$PWD/docker/protoc-usr/bin/protoc PROTOC_INCLUDE=$PWD/docker/protoc-usr/include
+   ```
+
 2. Customize values in the [Helm chart](https://helm.sh/) (`chart/values.yaml`): driver name, `storageClassName` (defaults to the driver name), `storageRoot`, `maxAgeSeconds`.
 3. Apply the chart
    ```

@@ -1,1 +1,7 @@
 /target
+/target-cross/
+docker/overlayfs-csi
+docker/protoc-usr/
+docker/protoc-*.zip
+docker/registries.yaml
+/.codegraph/
