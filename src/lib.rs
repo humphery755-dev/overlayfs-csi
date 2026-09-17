@@ -15,6 +15,8 @@ use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tracing::*;
 
+pub mod base;
+
 const BASE_CLEANUP_FREQ_S: u64 = 30;
 
 #[derive(Parser)]
