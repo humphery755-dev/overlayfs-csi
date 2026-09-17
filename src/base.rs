@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -77,6 +77,34 @@ impl Store {
     }
 }
 
+/// Parse `/proc/self/mountinfo` content into (mount point, lowerdirs) of overlay mounts.
+/// 注：mount point 内空格按 mountinfo 规则转义为 `\040`；K8s 路径不含空格，不做反转义。
+pub fn overlay_lowerdirs(mountinfo: &str) -> Vec<(String, Vec<PathBuf>)> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (_info, fs) = line.split_once(" - ")?;
+            let mut fields = fs.split_whitespace();
+            if fields.next()? != "overlay" {
+                return None;
+            }
+            // After " - ": <fstype> <source> <super_options>; lowerdir lives in super_options.
+            fields.next()?; // source
+            let opts = fields.next()?; // super options
+            let lower = opts.split(',').find_map(|o| o.strip_prefix("lowerdir="))?;
+            let mountpoint = _info.split_whitespace().nth(4)?.to_string();
+            Some((mountpoint, lower.split(':').map(PathBuf::from).collect()))
+        })
+        .collect()
+}
+
+/// Whether any overlay mount's lowerdir points at `base`.
+pub fn is_base_referenced(mountinfo: &str, base: &Path) -> bool {
+    overlay_lowerdirs(mountinfo)
+        .iter()
+        .any(|(_, dirs)| dirs.iter().any(|d| d == base))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +160,27 @@ mod tests {
         let valid = store.find_valid_base(3600).unwrap();
         assert_eq!(valid, Some(Base(store.bases_dir().join("b1"))));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const MOUNTINFO: &str = "\
+36 35 98:0 / /mnt/host rw - overlay none lowerdir=/var/lib/overlayfs-csi/bases/abc,upperdir=/volumes/v1,workdir=/work/v1 rw\n\
+37 36 0:41 / /proc rw,nosuid - proc proc rw\n\
+38 36 259:2 /data /mnt/host/data rw - overlay none lowerdir=/other/base,upperdir=/u2,workdir=/w2 rw\n";
+
+    #[test]
+    fn parses_overlay_lowerdirs() {
+        let m = overlay_lowerdirs(MOUNTINFO);
+        assert_eq!(m.len(), 2, "proc 行不是 overlay，必须被过滤");
+        assert_eq!(m[0].0, "/mnt/host");
+        assert_eq!(m[0].1, vec![PathBuf::from("/var/lib/overlayfs-csi/bases/abc")]);
+    }
+
+    #[test]
+    fn detects_base_reference() {
+        assert!(is_base_referenced(
+            MOUNTINFO,
+            Path::new("/var/lib/overlayfs-csi/bases/abc")
+        ));
+        assert!(!is_base_referenced(MOUNTINFO, Path::new("/bases/nope")));
     }
 }
