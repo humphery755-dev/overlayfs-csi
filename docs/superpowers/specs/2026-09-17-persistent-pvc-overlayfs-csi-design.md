@@ -103,7 +103,7 @@ PVC `Deleted` 事件 → API 删除对应 PV（自建 PV 无自定义 finalizer�
 - 固化 vs cleanup：时间戳先行，cleanup 不误删。
 - 固化临时挂载出现在 mountinfo → cleanup 引用判定天然覆盖。
 - PVC 删除 vs 活跃挂载：`pvc-protection` 兜底。
-- 同 PVC 并发 stage：沿用 `Mutex`。
+- 同 PVC 并发 stage/publish：stage 由 kubelet 对每卷串行调用；publish 的 bind 相互独立且 mkdir 幂等。新实现无共享内存状态，无需 Mutex（旧 `mapping` 随内存态一起移除，引用判定改走 mountinfo）。
 
 ## 代码结构
 
