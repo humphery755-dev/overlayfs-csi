@@ -245,7 +245,8 @@ impl Controller {
         // 3. 孤儿 work/ GC：对应 volume 目录不存在即孤儿（挂载中的 staging 必然有 volume 目录）
         let work_root = self.store.root.join("work");
         if work_root.exists() {
-            for entry in std::fs::read_dir(&work_root)?.filter_map(Result::ok) {
+            for entry in std::fs::read_dir(&work_root)? {
+                let entry = entry?;
                 let vid = entry.file_name().to_string_lossy().to_string();
                 if self.store.volume_dir(&vid).exists() {
                     continue;
@@ -266,7 +267,8 @@ impl Controller {
         managed: &HashSet<String>,
         mountinfo: &str,
     ) -> anyhow::Result<()> {
-        for entry in std::fs::read_dir(dir)?.filter_map(Result::ok) {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
             if managed.contains(&name) {
