@@ -96,7 +96,7 @@ spec:
           securityContext:
             privileged: true
           volumeMounts:
-            - mountPath: /bases
+            - mountPath: "{{ .Values.storageRoot }}"
               name: storage-root
             - mountPath: /csi
               name: socket-dir
