@@ -66,7 +66,7 @@ It would be fairly easy to support arbitrary volume types. For CSIs that support
    ```
    $ cd docker
    $ cross build -r --target-dir ../target-cross
-   $ cp ../target-cross/release/csi .
+   $ cp ../target-cross/release/overlayfs-csi .
    $ docker build -t overlayfs-csi .
    ```
 
