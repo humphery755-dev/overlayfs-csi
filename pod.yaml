@@ -1,19 +1,35 @@
+# 持久卷示例：独立 PVC + 引用它的 Pod。
+# namespace / nodeName 按实际部署调整；多节点部署时去掉 nodeName，交给调度器
+# （StorageClass 为 WaitForFirstConsumer，调度器会把选中的节点写进
+# volume.kubernetes.io/selected-node 注解，由该节点的驱动实例供给卷）。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: demo
+  namespace: overlayfs-csi
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: overlayfs.csi.k8s.io
+  resources:
+    requests:
+      storage: 10Gi
+---
 apiVersion: v1
 kind: Pod
 metadata:
-  generateName: test
+  name: test
   namespace: overlayfs-csi
 spec:
   nodeName: node1
   terminationGracePeriodSeconds: 1
-  volumes:
-    - name: test
-      csi:
-        driver: overlayfs.csi.k8s.io
   containers:
     - name: test
       image: debian:bullseye-slim
       command: ["sleep", "infinity"]
       volumeMounts:
-        - name: test
+        - name: data
           mountPath: /test
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: demo

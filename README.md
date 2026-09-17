@@ -1,6 +1,6 @@
 # overlayfs-csi
 
-This implements a Kubernetes [Container Storage Interface](https://github.com/container-storage-interface/spec/blob/master/spec.md) that creates volumes as [overlay mounts](https://en.wikipedia.org/wiki/OverlayFS) on top of previous volumes. In other words, only new and modified files are written to disk.
+This implements a Kubernetes [Container Storage Interface](https://github.com/container-storage-interface/spec/blob/master/spec.md) that provides persistent volumes as [overlay mounts](https://en.wikipedia.org/wiki/OverlayFS) on top of shared _base_ volumes. Only new and modified files are written to a volume's own data directory; everything it has in common with a base is shared read-only.
 
 This can be particularly useful in build pipelines, as it allows benefiting from incremental compilation (whenever supported) without having to copy all files for each run.
 
@@ -10,29 +10,58 @@ This repository also provides an example for building Kubernetes CSIs in Rust.
 
 ## Usage
 
-- Each pod requests a data volume from the CSI:
+- Volumes are requested as standalone [PVCs](https://kubernetes.io/docs/concepts/storage/persistent-volumes/) using this driver's StorageClass, and mounted through a `persistentVolumeClaim` reference:
 
   ```yaml
-  volumes:
-    - name: data
-      csi:
-        driver: overlayfs.csi.k8s.io
+  apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: demo
+  spec:
+    accessModes: ["ReadWriteOnce"]
+    storageClassName: overlayfs.csi.k8s.io
+    resources:
+      requests:
+        storage: 10Gi
+  ---
+  apiVersion: v1
+  kind: Pod
+  spec:
+    containers:
+      - name: test
+        volumeMounts:
+          - name: data
+            mountPath: /test
+    volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: demo
   ```
 
-- By writing a `.as_base` file on the volume, a pod can indicate that the volume can later be used as a _base_ for subsequent volumes.
+- The StorageClass uses `volumeBindingMode: WaitForFirstConsumer`: the volume is provisioned only once a pod using the PVC has been scheduled. The scheduler records the chosen node in the `volume.kubernetes.io/selected-node` annotation of the PVC, and the driver instance on that node creates a pre-bound PV named `overlayfs-<pvc-uid>` whose `nodeAffinity` pins the volume there. The PVC's data therefore lives on that node's local disk, and every later pod mounting the same PVC is scheduled onto the same node. In single-node clusters nothing needs to be done; in multi-node clusters just let the scheduler pick the node (do not set `nodeName` unless you want to pin it manually).
+
+- Data in a PVC is persistent: it survives pod deletion and recreation. See the caveat about [generic ephemeral volumes](https://kubernetes.io/docs/concepts/storage/projected-volumes/#generic-ephemeral-volume) below.
+
+> [!WARNING]
+> Do not use generic ephemeral volumes (`volume.csi` with a `volumeClaimTemplate` in the pod spec) with this driver for anything you want to keep. Such volumes are backed by a PVC that is deleted together with the pod, so their data is destroyed on pod deletion — they do not satisfy persistence needs. Use a standalone PVC as above.
+
+### Bases and `.as_base`
+
+- Whenever a valid base is available, a newly staged volume is an overlay filesystem on top of it. Otherwise, it starts empty.
+
+- The PVC data itself is persistent by construction, independently of bases. A base is only a shared read-only starting point for _subsequent, new_ PVCs.
+
+- By writing a `.as_base` file on the volume, a pod can indicate that the volume can later be used as a _base_ for subsequent volumes. When the volume is unstaged (its last pod unmounted it) and no valid base exists at that moment, the current environment — the base overlaid with the volume's increments, merged into a single tree — is frozen into a new base, which new PVCs will then layer on. If a valid base already exists, the promotion is skipped.
 
   - TODO: This could be replaced by a check on the pod exit status.
 
-- Whenever a base is available, the volume provided by the CSI is an overlay filesystem on top of it. Otherwise, it starts empty.
-
-- Old bases are cleaned up with a configurable interval. When this results in no base being available, the next vollume will be created from scratch, and then converted to a base.
-  - Converting overlays into bases is currently not supported.
+- Bases carry a creation timestamp and expire after `--max-age-s` (86400 s by default). Expired bases are cleaned up in the background unless an overlay mount still references them. When this results in no base being available, the next volume simply starts from scratch (until some volume is promoted again).
 
 ### Underlying storage
 
-For now, only node-local storage is supported for the bases (which in particular allows quickly converting volumes to bases) and overlays. In particular, this implies that each node maintains its own bases.
+Only node-local storage is supported: bases and per-PVC data directories live under a hostPath storage root (`storageRoot` Helm value, `/var/lib/overlayfs-csi` by default), which in particular allows quickly converting volumes to bases. Each node maintains its own bases, and a PVC's data lives on the node it was provisioned on (see above).
 
-It would be fairly easy to support arbitrary volumes type. For CSIs that support efficient [volume cloning](https://kubernetes.io/docs/concepts/storage/volume-pvc-datasource/), these could be used instead of the overlays.
+It would be fairly easy to support arbitrary volume types. For CSIs that support efficient [volume cloning](https://kubernetes.io/docs/concepts/storage/volume-pvc-datasource/), these could be used instead of the overlays.
 
 ## Installation
 
@@ -48,61 +77,49 @@ It would be fairly easy to support arbitrary volumes type. For CSIs that support
    $ docker build -t overlayfs-csi .
    ```
 
-2. Customize values in the [Helm chart](https://helm.sh/) (`chart/values.yaml`)
+2. Customize values in the [Helm chart](https://helm.sh/) (`chart/values.yaml`): driver name, `storageClassName` (defaults to the driver name), `storageRoot`, `maxAgeSeconds`.
 3. Apply the chart
    ```
    $ helm install overlayfs-csi chart
    ```
 
-The test the deployment:
+To test the deployment, apply [`pod.yaml`](pod.yaml), which creates a PVC and a pod mounting it at `/test`:
 
-1. Create a pod
-   ```yaml
-   apiVersion: v1
-   kind: Pod
-   metadata:
-     generateName: test
-   spec:
-     nodeName: node1
-     terminationGracePeriodSeconds: 1
-     volumes:
-       - name: test
-         csi:
-           driver: overlayfs.csi.k8s.io
-     containers:
-       - name: test
-         image: debian:bullseye-slim
-         command: ["sleep", "infinity"]
-         volumeMounts:
-           - name: test
-             mountPath: /test
+1. Create the namespace if needed, then apply the example
    ```
-2. Write some data and `.as_base` to the volume
+   $ kubectl create namespace overlayfs-csi
+   $ kubectl apply -f pod.yaml
    ```
-   $ touch /test/.as_base
+2. Write some data and mark the volume as base material
+   ```
    $ touch /test/hello
+   $ touch /test/.as_base
    ```
-3. Delete the pod
-4. Create a new pod, and observe that it now used the previous volume as base.
+3. Delete the pod, then apply `pod.yaml` again: the pod remounts the same PVC and the data is still there.
    ```
    $ ls /test
    hello
    $ touch /test/hi
    ```
-   Data written to that pod goes exclusively to the overlay. The base is not modified, and no untouched file is copied.
+   Writes go to the volume's own data directory only. A base — if one exists — is never modified, and no untouched file is copied.
+4. Once the pod from step 2 was deleted, its `.as_base` marker caused the volume to be frozen into a new base on unstage (assuming no valid base existed). A _new_ PVC created afterwards starts as an overlay on top of it and therefore already contains `hello`.
 
 ## Implementation details
 
-- A single Rust binary implements the required Identity and Node CSI services. Kubelet communicates with it using a UNIX socket.
-- A daemonset runs one such server per node, following the Kubernetes CSI design.
-- Each server has a `bases` volume, where bases are kept.
-- When the server receives a volume publishing request, either:
-  - There are no bases available and a bind mount is made with an empty folder.
-  - There is a a base available, and an overlayfs mount is made.
-- When the server receives a volume unpublishing request, if there are no bases available and the volume is a candidate, it converts the volume into a base. Otherwise, the volume is simply removed. Only volumes created from scratch, not overlays, can be converted into bases.
-- The server cleans stale bases regularly.
-- To be able to properly interact with [ephemeral storage limits](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#local-ephemeral-storage) (and later with other underlying storages), the overlay upper and work layers (where new and modified files are written) are taken from dynamically scheduled pods. This is required, as we cannot dynamically attach new volumes to the CSI pods.
-- When moving from a pod to the `base` volume, we have to access the volume from the host path (`/var/lib/kubelet/pods/{}/volumes/`) to avoid spurious cross-device errors.
+- A single Rust binary implements the required Identity, Node and Controller CSI services. Kubelet communicates with the Node service using a UNIX socket.
+- A daemonset runs one such server per node, following the Kubernetes CSI design. The `CSIDriver` object advertises only the `Persistent` volume lifecycle mode (inline ephemeral volumes are not supported) and the `STAGE_UNSTAGE_VOLUME` node capability.
+- Each server has a hostPath storage root (`--bases`, the `storageRoot` value) with three subdirectories: `bases/` (shared read-only base trees), `volumes/<pv-name>/` (per-PVC data directories) and `work/<pv-name>/` (overlay work directories).
+- Provisioning is not done through the CSI Controller service, but by a controller loop in each node's server that watches all PVCs:
+  - A PVC that is `Pending`, whose `storageClassName` matches this node's StorageClass and whose `volume.kubernetes.io/selected-node` annotation equals this node gets a pre-bound PV `overlayfs-<pvc-uid>` (labelled `app.kubernetes.io/managed-by: overlayfs-csi`, reclaim policy `Delete`, node affinity to this node). The operation is idempotent, and a 30 s reconcile loop replays it after restarts.
+  - A deleted PVC triggers deletion of its PV and removal of the corresponding data and work directories on this node.
+- Mounting is two-phase, as required by the advertised `STAGE_UNSTAGE_VOLUME` capability:
+  - `NodeStageVolume` either overlay-mounts the volume data directory (as upper layer, with a `work/` directory) on top of a valid base onto the staging path, or — when no valid base exists — bind-mounts the data directory itself.
+  - `NodePublishVolume` bind-mounts the staging path into the pod; `NodeUnpublishVolume`/`NodeUnstageVolume` umount (idempotently) in reverse order.
+- `NodeUnstageVolume` performs the base promotion described above: if the volume contains `.as_base` and no valid base exists, the current view is copied into `bases/<uuid>/` with a fresh timestamp (`cp --reflink=auto` first, with rollback of the destination on failure). The stage decision is evaluated once and reused for the promotion, to avoid a concurrent unstage merging unrelated volume data into the frozen base.
+- A background janitor (30 s interval) runs on each node:
+  - Base TTL cleanup: bases whose timestamp is older than `--max-age-s` are removed, unless `/proc/self/mountinfo` shows an overlay mount whose `lowerdir` still points at them (reference detection by parsing mountinfo).
+  - Orphan GC: `volumes/` directories without a matching managed PV — and older than a 5 minute grace period — are removed, as are `work/` directories whose volume directory no longer exists.
+- If a snapshot of `/proc/self/mountinfo` parses to zero overlay mounts, the janitor logs a warning and skips reference-based deletions, since the reference checks would silently pass.
 
 ## TODOs
 
