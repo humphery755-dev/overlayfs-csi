@@ -10,7 +10,7 @@ This repository also provides an example for building Kubernetes CSIs in Rust.
 
 ## Usage
 
-- Volumes are requested as standalone [PVCs](https://kubernetes.io/docs/concepts/storage/persistent-volumes/) using this driver's StorageClass, and mounted through a `persistentVolumeClaim` reference:
+- Volumes are requested as standalone [PVCs](https://kubernetes.io/docs/concepts/storage/persistent-volumes/) using this driver's StorageClass, and mounted through a `persistentVolumeClaim` reference (see [`pod.yaml`](pod.yaml) for a complete example):
 
   ```yaml
   apiVersion: v1
@@ -24,18 +24,11 @@ This repository also provides an example for building Kubernetes CSIs in Rust.
       requests:
         storage: 10Gi
   ---
-  apiVersion: v1
-  kind: Pod
-  spec:
-    containers:
-      - name: test
-        volumeMounts:
-          - name: data
-            mountPath: /test
-    volumes:
-      - name: data
-        persistentVolumeClaim:
-          claimName: demo
+  # in the pod spec:
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: demo
   ```
 
 - The StorageClass uses `volumeBindingMode: WaitForFirstConsumer`: the volume is provisioned only once a pod using the PVC has been scheduled. The scheduler records the chosen node in the `volume.kubernetes.io/selected-node` annotation of the PVC, and the driver instance on that node creates a pre-bound PV named `overlayfs-<pvc-uid>` whose `nodeAffinity` pins the volume there. The PVC's data therefore lives on that node's local disk, and every later pod mounting the same PVC is scheduled onto the same node. In single-node clusters nothing needs to be done; in multi-node clusters just let the scheduler pick the node (do not set `nodeName` unless you want to pin it manually).
