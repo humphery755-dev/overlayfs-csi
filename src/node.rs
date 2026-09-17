@@ -82,19 +82,23 @@ impl v1::node_server::Node for NodeService {
         let vdir = self.store.volume_dir(&req.volume_id);
         let marker = vdir.join(base::AS_BASE_FILENAME);
         if marker.exists() {
-            match stage_overlay_decision(&self.store, self.max_age_s) {
-                Ok(None) => {
+            // TOCTOU：stage 决策只评估一次，promote 复用同一结果。
+            // 若 promote 内部重新评估，并发 unstage 可能在间隙固化出新 base，
+            // 导致把别的 volume 数据合并进本次固化结果。
+            let decision = stage_overlay_decision(&self.store, self.max_age_s)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            match &decision {
+                None => {
                     let new_id = uuid::Uuid::new_v4().to_string();
                     tracing::info!(volume_id = %req.volume_id, base_id = %new_id, "promoting volume to base");
-                    self.promote(&req.volume_id, &vdir, &new_id)
+                    self.promote(&req.volume_id, &vdir, &new_id, decision.clone())
                         .map_err(|e| {
                             tracing::error!("promote failed: {e:#}");
                             Status::internal(format!("base promotion failed: {e:#}"))
                         })?;
                     std::fs::remove_file(&marker).map_err(|e| Status::internal(e.to_string()))?;
                 }
-                Ok(Some(_)) => tracing::info!("valid base exists, skipping promotion"),
-                Err(e) => return Err(Status::internal(e.to_string())),
+                Some(_) => tracing::info!("valid base exists, skipping promotion"),
             }
         }
         // work 目录回收
@@ -153,7 +157,17 @@ impl v1::node_server::Node for NodeService {
         &self,
         _req: Request<v1::NodeGetCapabilitiesRequest>,
     ) -> Result<Response<v1::NodeGetCapabilitiesResponse>, Status> {
-        Ok(Response::new(Default::default()))
+        // 必须通告 STAGE_UNSTAGE_VOLUME：kubelet 仅在驱动声明该能力时才调用
+        // NodeStageVolume；否则两段式退化为无 staging 的 publish，流程无法工作。
+        Ok(Response::new(v1::NodeGetCapabilitiesResponse {
+            capabilities: vec![v1::NodeServiceCapability {
+                r#type: Some(v1::node_service_capability::Type::Rpc(
+                    v1::node_service_capability::Rpc {
+                        r#type: v1::node_service_capability::rpc::Type::StageUnstageVolume as i32,
+                    },
+                )),
+            }],
+        }))
     }
 
     async fn node_get_info(
@@ -169,13 +183,14 @@ impl v1::node_server::Node for NodeService {
 
 impl NodeService {
     /// 固化：有旧 base → overlay ro 合并视图；无 → 数据目录即完整视图。
+    /// `lower` 由调用方评估后传入：固化路径内不得重新评估 stage 决策（TOCTOU）。
     fn promote(
         &self,
         volume_id: &str,
         vdir: &Path,
         new_id: &str,
+        lower: Option<Base>,
     ) -> anyhow::Result<std::path::PathBuf> {
-        let lower = stage_overlay_decision(&self.store, self.max_age_s)?;
         match lower {
             Some(b) => {
                 let merged = std::env::temp_dir().join(format!("ofcsi-merged-{new_id}"));
