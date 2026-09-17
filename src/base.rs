@@ -62,11 +62,14 @@ impl Store {
         self.root.join("work").join(volume_id)
     }
     pub fn list_bases(&self) -> anyhow::Result<Vec<Base>> {
-        Ok(std::fs::read_dir(&self.bases_dir())?
-            .filter_map(Result::ok)
-            .filter(|x| x.file_type().map_or(false, |t| t.is_dir()))
-            .map(|x| Base(x.path()))
-            .collect())
+        let mut bases = Vec::new();
+        for entry in std::fs::read_dir(&self.bases_dir())? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                bases.push(Base(entry.path()));
+            }
+        }
+        Ok(bases)
     }
 
     pub fn find_valid_base(&self, max_age_s: i64) -> anyhow::Result<Option<Base>> {
