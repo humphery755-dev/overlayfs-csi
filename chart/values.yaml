@@ -1,9 +1,9 @@
-namespace: overlayfs-csi
+namespace: kube-system
 image: overlayfs-csi:latest
 name: overlayfs.csi.k8s.io
-# Size for the per-node volumes that hold bases
-basesSizeLimit: 10Gi
-# Size for each overlay
-sizeLimit: 10Gi
+# StorageClass 名；留空则使用 driver name
+storageClassName: ""
+# Host path root for bases/volumes/work
+storageRoot: /var/lib/overlayfs-csi
 # Maximum age of a base before cleaning it up
 maxAgeSeconds: 86400
