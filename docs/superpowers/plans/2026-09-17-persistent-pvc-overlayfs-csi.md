@@ -1627,11 +1627,11 @@ rules:
             - "--max-age-s={{ .Values.maxAgeSeconds }}"
 ```
 
-4. csi 容器 volumeMounts（删除 storageroot-dir/storagerunroot-dir 两个挂载——containerd storage 目录是模板残留，与本 driver 无关）：
+4. csi 容器 volumeMounts（删除 storageroot-dir/storagerunroot-dir 两个挂载——containerd storage 目录是模板残留，与本 driver 无关。**注意：storage-root 的 mountPath 必须等于 `{{ .Values.storageRoot }}`，与 `--bases` flag 值三元一致（flag 值 == mountPath == hostPath），否则 driver 会把数据写进容器临时层**）：
 
 ```yaml
           volumeMounts:
-            - mountPath: /bases
+            - mountPath: "{{ .Values.storageRoot }}"
               name: storage-root
             - mountPath: /csi
               name: socket-dir
