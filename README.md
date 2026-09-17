@@ -44,6 +44,8 @@ This repository also provides an example for building Kubernetes CSIs in Rust.
 
 - Whenever a valid base is available, a newly staged volume is an overlay filesystem on top of it. Otherwise, it starts empty.
 
+- **What you see inside the volume differs between the two modes.** Without a base, the volume is the data directory itself (a plain bind mount): it contains everything you wrote. With a base underneath, the data directory holds only your *increments* (plus whiteout entries for deleted base files — they appear as character devices when you `ls -la`); the full view you get in the pod is base + increments. This matters after long downtime: if the base has expired by then, a remounted volume shows only your own files — nothing is lost, the shared layer is simply gone (raise `maxAgeSeconds` to keep it).
+
 - The PVC data itself is persistent by construction, independently of bases. A base is only a shared read-only starting point for _subsequent, new_ PVCs.
 
 - By writing a `.as_base` file on the volume, a pod can indicate that the volume can later be used as a _base_ for subsequent volumes. When the volume is unstaged (its last pod unmounted it) and no valid base exists at that moment, the current environment — the base overlaid with the volume's increments, merged into a single tree — is frozen into a new base, which new PVCs will then layer on. If a valid base already exists, the promotion is skipped.
@@ -82,29 +84,28 @@ It would be fairly easy to support arbitrary volume types. For CSIs that support
    $ export PROTOC=$PWD/docker/protoc-usr/bin/protoc PROTOC_INCLUDE=$PWD/docker/protoc-usr/include
    ```
 
-2. Customize values in the [Helm chart](https://helm.sh/) (`chart/values.yaml`): driver name, `storageClassName` (defaults to the driver name), `storageRoot`, `maxAgeSeconds`.
+2. Customize values in the [Helm chart](https://helm.sh/) (`chart/values.yaml`): `namespace`, `image`, driver `name`, `storageClassName` (defaults to the driver name), `storageRoot`, `maxAgeSeconds` (per-volume overridable, see above).
 3. Apply the chart
    ```
    $ helm install overlayfs-csi chart
    ```
 
-To test the deployment, apply [`pod.yaml`](pod.yaml), which creates a PVC and a pod mounting it at `/test`:
+To test the deployment, apply [`pod.yaml`](pod.yaml), which creates a PVC and a pod mounting it at `/test` (both in the `kube-system` namespace, matching the chart default):
 
-1. Create the namespace if needed, then apply the example
+1. Apply the example (the namespace already exists in most clusters; adjust it in `pod.yaml` if yours differs)
    ```
-   $ kubectl create namespace overlayfs-csi --dry-run=client -o yaml | kubectl apply -f -
    $ kubectl apply -f pod.yaml
    ```
 2. Write some data and mark the volume as base material
    ```
-   $ touch /test/hello
-   $ touch /test/.as_base
+   $ kubectl exec test -- touch /test/hello
+   $ kubectl exec test -- touch /test/.as_base
    ```
 3. Delete the pod, then apply `pod.yaml` again: the pod remounts the same PVC and the data is still there.
    ```
-   $ ls /test
+   $ kubectl exec test -- ls /test
    hello
-   $ touch /test/hi
+   $ kubectl exec test -- touch /test/hi
    ```
    Writes go to the volume's own data directory only. A base — if one exists — is never modified, and no untouched file is copied.
 4. Once the pod from step 2 was deleted, its `.as_base` marker caused the volume to be frozen into a new base on unstage (assuming no valid base existed). A _new_ PVC created afterwards starts as an overlay on top of it and therefore already contains `hello`.
@@ -122,7 +123,7 @@ $ kubectl apply -f pod.yaml      # days later: same PVC reused, all changes are 
 
 ## Implementation details
 
-- A single Rust binary implements the required Identity, Node and Controller CSI services. Kubelet communicates with the Node service using a UNIX socket.
+- A single Rust binary implements the Identity and Node CSI services (plus a Controller stub whose RPCs are all unimplemented — provisioning deliberately bypasses the CSI Controller service, see below). Kubelet communicates with the Node service using a UNIX socket.
 - A daemonset runs one such server per node, following the Kubernetes CSI design. The `CSIDriver` object advertises only the `Persistent` volume lifecycle mode (inline ephemeral volumes are not supported) and the `STAGE_UNSTAGE_VOLUME` node capability.
 - Each server has a hostPath storage root (`--bases`, the `storageRoot` value) with three subdirectories: `bases/` (shared read-only base trees), `volumes/<pv-name>/` (per-PVC data directories) and `work/<pv-name>/` (overlay work directories).
 - Provisioning is not done through the CSI Controller service, but by a controller loop in each node's server that watches all PVCs:
@@ -131,9 +132,10 @@ $ kubectl apply -f pod.yaml      # days later: same PVC reused, all changes are 
 - Mounting is two-phase, as required by the advertised `STAGE_UNSTAGE_VOLUME` capability:
   - `NodeStageVolume` either overlay-mounts the volume data directory (as upper layer, with a `work/` directory) on top of a valid base onto the staging path, or — when no valid base exists — bind-mounts the data directory itself.
   - `NodePublishVolume` bind-mounts the staging path into the pod; `NodeUnpublishVolume`/`NodeUnstageVolume` umount (idempotently) in reverse order.
-- `NodeUnstageVolume` performs the base promotion described above: if the volume contains `.as_base` and no valid base exists, the current view is copied into `bases/<uuid>/` with a fresh timestamp (`cp --reflink=auto` first, with rollback of the destination on failure). The merged view includes the base the volume was staged on, read from `/proc/self/mountinfo` before the staging mount is removed — so it joins the frozen tree even if its TTL has since expired. The stage decision is evaluated once and reused for the promotion, to avoid a concurrent unstage merging unrelated volume data into the frozen base.
+- `NodeUnstageVolume` performs the base promotion described above: if the volume contains `.as_base` and no valid base exists, the current view is copied into `bases/<uuid>/` with a fresh timestamp (`cp --reflink=auto` first, with rollback of the destination on failure). The merged view includes the base the volume was staged on, read from `/proc/self/mountinfo` before the staging mount is removed — so it joins the frozen tree even if its TTL has since expired. The stage decision is evaluated once and reused for the promotion, to avoid a concurrent unstage merging unrelated volume data into the frozen base. If the PVC carried a `max-age-s` annotation, that per-volume TTL is written into the new base.
+- Two driver-managed files may appear at the root of a volume's data directory: `.as_base` (the promotion marker a pod writes, removed after it is consumed) and `.ofcsi-max-age-s` (the per-volume TTL the driver records at stage time). Everything else in the directory is yours.
 - A background janitor (30 s interval) runs on each node:
-  - Base TTL cleanup: bases whose timestamp is older than `--max-age-s` are removed, unless `/proc/self/mountinfo` shows an overlay mount whose `lowerdir` still points at them (reference detection by parsing mountinfo).
+  - Base TTL cleanup: bases older than their *effective* TTL — the per-volume value embedded in the base, or the global `--max-age-s` when it has none — are removed, unless `/proc/self/mountinfo` shows an overlay mount whose `lowerdir` still points at them (reference detection by parsing mountinfo).
   - Orphan GC: `volumes/` directories without a matching managed PV — and older than a 5 minute grace period — are removed, as are `work/` directories whose volume directory no longer exists.
 - If a snapshot of `/proc/self/mountinfo` parses to zero overlay mounts, the janitor logs a warning and skips the entire cleanup round, since the reference checks could not be trusted not to silently pass.
 
