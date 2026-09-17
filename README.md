@@ -52,7 +52,7 @@ This repository also provides an example for building Kubernetes CSIs in Rust.
 
 ### Underlying storage
 
-Only node-local storage is supported: bases and per-PVC data directories live under a hostPath storage root (`storageRoot` Helm value, `/var/lib/overlayfs-csi` by default), which in particular allows quickly converting volumes to bases. Each node maintains its own bases, and a PVC's data lives on the node it was provisioned on (see above).
+Only node-local storage is supported: bases and per-PVC data directories live under a hostPath storage root (`storageRoot` Helm value, `/var/lib/overlayfs-csi` by default), which in particular allows quickly converting volumes to bases. Each node maintains its own bases, and a PVC's data lives on the node it was provisioned on (see above). Bases are ordinary directories under this path, so driver pod restarts and redeployments do not lose them.
 
 It would be fairly easy to support arbitrary volume types. For CSIs that support efficient [volume cloning](https://kubernetes.io/docs/concepts/storage/volume-pvc-datasource/), these could be used instead of the overlays.
 
@@ -80,7 +80,7 @@ To test the deployment, apply [`pod.yaml`](pod.yaml), which creates a PVC and a 
 
 1. Create the namespace if needed, then apply the example
    ```
-   $ kubectl create namespace overlayfs-csi
+   $ kubectl create namespace overlayfs-csi --dry-run=client -o yaml | kubectl apply -f -
    $ kubectl apply -f pod.yaml
    ```
 2. Write some data and mark the volume as base material
@@ -108,11 +108,11 @@ To test the deployment, apply [`pod.yaml`](pod.yaml), which creates a PVC and a 
 - Mounting is two-phase, as required by the advertised `STAGE_UNSTAGE_VOLUME` capability:
   - `NodeStageVolume` either overlay-mounts the volume data directory (as upper layer, with a `work/` directory) on top of a valid base onto the staging path, or — when no valid base exists — bind-mounts the data directory itself.
   - `NodePublishVolume` bind-mounts the staging path into the pod; `NodeUnpublishVolume`/`NodeUnstageVolume` umount (idempotently) in reverse order.
-- `NodeUnstageVolume` performs the base promotion described above: if the volume contains `.as_base` and no valid base exists, the current view is copied into `bases/<uuid>/` with a fresh timestamp (`cp --reflink=auto` first, with rollback of the destination on failure). The stage decision is evaluated once and reused for the promotion, to avoid a concurrent unstage merging unrelated volume data into the frozen base.
+- `NodeUnstageVolume` performs the base promotion described above: if the volume contains `.as_base` and no valid base exists, the current view is copied into `bases/<uuid>/` with a fresh timestamp (`cp --reflink=auto` first, with rollback of the destination on failure). The merged view includes the base the volume was staged on, read from `/proc/self/mountinfo` before the staging mount is removed — so it joins the frozen tree even if its TTL has since expired. The stage decision is evaluated once and reused for the promotion, to avoid a concurrent unstage merging unrelated volume data into the frozen base.
 - A background janitor (30 s interval) runs on each node:
   - Base TTL cleanup: bases whose timestamp is older than `--max-age-s` are removed, unless `/proc/self/mountinfo` shows an overlay mount whose `lowerdir` still points at them (reference detection by parsing mountinfo).
   - Orphan GC: `volumes/` directories without a matching managed PV — and older than a 5 minute grace period — are removed, as are `work/` directories whose volume directory no longer exists.
-- If a snapshot of `/proc/self/mountinfo` parses to zero overlay mounts, the janitor logs a warning and skips reference-based deletions, since the reference checks would silently pass.
+- If a snapshot of `/proc/self/mountinfo` parses to zero overlay mounts, the janitor logs a warning and skips the entire cleanup round, since the reference checks could not be trusted not to silently pass.
 
 ## TODOs
 
