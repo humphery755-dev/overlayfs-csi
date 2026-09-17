@@ -1,5 +1,7 @@
 # overlayfs-csi
 
+English | [简体中文](README.zh-CN.md)
+
 This implements a Kubernetes [Container Storage Interface](https://github.com/container-storage-interface/spec/blob/master/spec.md) that provides persistent volumes as [overlay mounts](https://en.wikipedia.org/wiki/OverlayFS) on top of shared _base_ volumes. Only new and modified files are written to a volume's own data directory; everything it has in common with a base is shared read-only.
 
 This can be particularly useful in build pipelines, as it allows benefiting from incremental compilation (whenever supported) without having to copy all files for each run.
