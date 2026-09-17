@@ -105,6 +105,82 @@ pub fn is_base_referenced(mountinfo: &str, base: &Path) -> bool {
         .any(|(_, dirs)| dirs.iter().any(|d| d == base))
 }
 
+pub fn mount_overlay(
+    id: &str,
+    lower: &Path,
+    upper: &Path,
+    work: &Path,
+    ro: bool,
+    mountpoint: &Path,
+) -> anyhow::Result<()> {
+    let mut opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lower.display(),
+        upper.display(),
+        work.display()
+    );
+    if ro {
+        opts.push_str(",ro");
+    }
+    duct::cmd!("mount", "-t", "overlay", id, "-o", opts, mountpoint).run()?;
+    Ok(())
+}
+
+pub fn mount_bind(src: &Path, mountpoint: &Path) -> anyhow::Result<()> {
+    duct::cmd!("mount", "--bind", src, mountpoint).run()?;
+    Ok(())
+}
+
+pub fn umount_idempotent(mountpoint: &Path) -> anyhow::Result<()> {
+    let out = duct::cmd!("umount", mountpoint).unchecked().run()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let not_mounted = stderr.contains("not mounted")
+            || stderr.contains("Invalid argument")
+            || stderr.contains("No such file or directory");
+        anyhow::ensure!(
+            not_mounted,
+            "umount {} failed: {}",
+            mountpoint.display(),
+            stderr
+        );
+    }
+    Ok(())
+}
+
+pub fn promote_to_base_with_mount(
+    store: &Store,
+    merged: &Path,
+    new_id: &str,
+) -> anyhow::Result<PathBuf> {
+    let dst = store.bases_dir().join(new_id);
+    let result = (|| -> anyhow::Result<()> {
+        std::fs::create_dir_all(&dst)?;
+        // 时间戳先行：TTL cleanup 只删过期 base，新时间戳保证固化过程中不被误删
+        Base(dst.clone()).write_time()?;
+        duct::cmd!(
+            "cp",
+            "-a",
+            "--reflink=auto",
+            format!("{}/.", merged.display()),
+            format!("{}/", dst.display())
+        )
+        .run()?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(dst),
+        Err(e) => {
+            if let Err(re) = std::fs::remove_dir_all(&dst) {
+                return Err(anyhow::anyhow!(
+                    "promote failed: {e:#}; rollback also failed: {re}"
+                ));
+            }
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +258,105 @@ mod tests {
             Path::new("/var/lib/overlayfs-csi/bases/abc")
         ));
         assert!(!is_base_referenced(MOUNTINFO, Path::new("/bases/nope")));
+    }
+
+    /// 非 root 环境自动 skip（集成测试需要真实 mount）。
+    fn require_root() -> bool {
+        let ok = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .map(|o| o.stdout == b"0\n")
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("skipping: requires root");
+        }
+        ok
+    }
+
+    #[test]
+    fn overlay_mount_unmount_roundtrip() {
+        if !require_root() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ofcsi-mount-{}", std::process::id()));
+        let lower = dir.join("lower");
+        let upper = dir.join("upper");
+        let work = dir.join("work");
+        let mnt = dir.join("mnt");
+        for d in [&lower, &upper, &work, &mnt] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(lower.join("from-base"), "base").unwrap();
+
+        mount_overlay("t1", &lower, &upper, &work, false, &mnt).unwrap();
+        assert_eq!(std::fs::read_to_string(mnt.join("from-base")).unwrap(), "base");
+        std::fs::write(mnt.join("new-file"), "upper").unwrap();
+        assert_eq!(std::fs::read_to_string(upper.join("new-file")).unwrap(), "upper", "写入必须落 upper");
+
+        umount_idempotent(&mnt).unwrap();
+        umount_idempotent(&mnt).unwrap(); // 二次 umount 必须幂等成功
+        assert!(!mnt.join("from-base").exists(), "umount 后应露回空目录");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn promote_merges_overlay_view() {
+        if !require_root() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ofcsi-promote-{}", std::process::id()));
+        let store = Store::new(&dir);
+        std::fs::create_dir_all(store.bases_dir()).unwrap();
+        let base_dir = store.bases_dir().join("old");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::write(base_dir.join("old-file"), "old").unwrap();
+        Base(base_dir.clone()).write_time().unwrap();
+
+        // volume：删 old-file（产生 whiteout）、写 new-file
+        let vdir = store.volume_dir("v1");
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::write(vdir.join("new-file"), "new").unwrap();
+
+        let work = store.work_dir("v1");
+        std::fs::create_dir_all(&work).unwrap();
+        let merged = dir.join("merged");
+        std::fs::create_dir_all(&merged).unwrap();
+        mount_overlay("t2", &base_dir, &vdir, &work, true, &merged).unwrap();
+
+        // 在合并视图里制造 whiteout：删除 old-file
+        std::fs::remove_file(merged.join("old-file")).unwrap();
+
+        let dst = promote_to_base_with_mount(&store, &merged, "newbase").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dst.join("new-file")).unwrap(),
+            "new",
+            "固化必须包含 upper 增量"
+        );
+        assert!(!dst.join("old-file").exists(), "whiteout 语义必须在固化结果中生效");
+        assert!(dst.join(AS_BASE_FILENAME).exists(), "固化必须写入时间戳");
+        Base(dst.clone()).read_time().unwrap(); // 时间戳可解析
+        // 源 volume 不受影响
+        assert!(vdir.join("new-file").exists());
+        umount_idempotent(&merged).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn promote_without_base_copies_volume() {
+        if !require_root() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ofcsi-promote2-{}", std::process::id()));
+        let store = Store::new(&dir);
+        std::fs::create_dir_all(store.bases_dir()).unwrap();
+        let vdir = store.volume_dir("v2");
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::write(vdir.join("f"), "1").unwrap();
+
+        let dst = promote_to_base_with_mount(&store, &vdir, "nb2").unwrap();
+        assert_eq!(std::fs::read_to_string(dst.join("f")).unwrap(), "1");
+        assert!(dst.join(AS_BASE_FILENAME).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
