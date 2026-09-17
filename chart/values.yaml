@@ -10,4 +10,5 @@ storageRoot: /var/lib/overlayfs-csi
 # 此值决定「停机后重建 Pod 时，启动环境的完整视图」能回粘多久：
 # 需要停机 N 天后仍拿到完整环境（base + 变更），就把此值设为大于 N 天。
 # 86400=1 天；2592000=30 天（下例）。
+# 可被 PVC 注解 overlayfs.csi.k8s.io/max-age-s 逐卷覆盖。
 maxAgeSeconds: 2592000

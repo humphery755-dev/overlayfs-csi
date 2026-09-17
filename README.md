@@ -52,6 +52,8 @@ This repository also provides an example for building Kubernetes CSIs in Rust.
 
 - Bases carry a creation timestamp and expire after `--max-age-s` (2592000 s, i.e. 30 days, by default). Expired bases are cleaned up in the background unless an overlay mount still references them. When this results in no base being available, the next volume simply starts from scratch (until some volume is promoted again).
 
+- The effective TTL can be set per volume: annotate the PVC with `overlayfs.csi.k8s.io/max-age-s: "<seconds>"`, and the base promoted from that volume uses that TTL instead of the global value. Invalid or missing annotations fall back to the global `maxAgeSeconds`.
+
 ### Underlying storage
 
 Only node-local storage is supported: bases and per-PVC data directories live under a hostPath storage root (`storageRoot` Helm value, `/var/lib/overlayfs-csi` by default), which in particular allows quickly converting volumes to bases. Each node maintains its own bases, and a PVC's data lives on the node it was provisioned on (see above). Bases are ordinary directories under this path, so driver pod restarts and redeployments do not lose them.

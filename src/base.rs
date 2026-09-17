@@ -1,9 +1,13 @@
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 pub const AS_BASE_FILENAME: &str = ".as_base";
+/// 卷级 TTL 元文件：stage 时由 volume_context 写入，unstage 固化时读取。
+/// NodeUnstageVolumeRequest 没有 volume_context 字段，无法像 stage 一样透传。
+pub const VOLUME_TTL_FILENAME: &str = ".ofcsi-max-age-s";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Base(pub PathBuf);
@@ -13,20 +17,33 @@ impl Base {
         self.0.join(AS_BASE_FILENAME)
     }
 
-    pub fn write_time(&self) -> anyhow::Result<()> {
-        std::fs::write(
-            self.as_base_file(),
-            OffsetDateTime::now_utc().format(&Rfc3339)?,
-        )?;
+    /// 写入时间戳与可选的卷级 TTL（秒）。两行格式：第一行 RFC3339 时间戳，
+    /// 第二行 TTL；ttl 为 None 时只有第一行（旧格式，TTL 回退全局值）。
+    pub fn write_time(&self, ttl: Option<i64>) -> anyhow::Result<()> {
+        let mut data = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        if let Some(ttl) = ttl {
+            data.push('\n');
+            data.push_str(&ttl.to_string());
+        }
+        std::fs::write(self.as_base_file(), data)?;
         Ok(())
     }
 
     pub fn read_time(&self) -> anyhow::Result<OffsetDateTime> {
         let data = std::fs::read_to_string(self.as_base_file())?;
-        Ok(OffsetDateTime::parse(&data, &Rfc3339)?)
+        let first = data.lines().next().context("empty .as_base file")?;
+        Ok(OffsetDateTime::parse(first, &Rfc3339)?)
+    }
+
+    /// 内嵌的卷级 TTL（秒）。旧单行格式或第二行损坏 → None（回退全局值）。
+    pub fn ttl(&self) -> Option<i64> {
+        let data = std::fs::read_to_string(self.as_base_file()).ok()?;
+        data.lines().nth(1).and_then(|l| l.trim().parse().ok())
     }
 
     pub fn valid(&self, max_age_s: i64) -> bool {
+        // 内嵌 TTL 优先（该卷固化时声明），缺省回退全局值——旧格式 base 天然兼容
+        let effective = self.ttl().unwrap_or(max_age_s);
         let Ok(dt) = self.read_time() else {
             return false;
         };
@@ -35,7 +52,7 @@ impl Base {
             tracing::warn!(?self, "Base in the future");
             false
         } else {
-            age.whole_seconds() < max_age_s
+            age.whole_seconds() < effective
         }
     }
 }
@@ -183,12 +200,13 @@ pub fn promote_to_base_with_mount(
     store: &Store,
     merged: &Path,
     new_id: &str,
+    ttl: Option<i64>,
 ) -> anyhow::Result<PathBuf> {
     let dst = store.bases_dir().join(new_id);
     let result = (|| -> anyhow::Result<()> {
         std::fs::create_dir_all(&dst)?;
         // 时间戳先行：TTL cleanup 只删过期 base，新时间戳保证固化过程中不被误删
-        Base(dst.clone()).write_time()?;
+        Base(dst.clone()).write_time(ttl)?;
         duct::cmd!(
             "cp",
             "-a",
@@ -199,7 +217,7 @@ pub fn promote_to_base_with_mount(
         .run()?;
         // cp -a 会把源数据目录里的 `.as_base` 标记（0 字节）覆盖进 dst，
         // 导致时间戳不可解析、base 永久失效、随后被 TTL janitor 误删 —— 拷贝完成后重写。
-        Base(dst.clone()).write_time()?;
+        Base(dst.clone()).write_time(ttl)?;
         Ok(())
     })();
     match result {
@@ -254,11 +272,49 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ofcsi-test-{}", std::process::id()));
         let base = Base(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
-        base.write_time().unwrap();
+        base.write_time(None).unwrap();
         assert!(base.valid(3600), "fresh base must be valid");
 
         std::fs::write(base.as_base_file(), past_timestamp(7200)).unwrap();
         assert!(!base.valid(3600), "base older than TTL must be invalid");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn base_ttl_overrides_global() {
+        // 两行格式：较早创建 + 内嵌小 TTL → 即使全局 TTL 很大也判定过期
+        let dir = std::env::temp_dir().join(format!("ofcsi-ttl-{}", std::process::id()));
+        let base = Base(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            base.as_base_file(),
+            format!("{}\n100", past_timestamp(200)),
+        )
+        .unwrap();
+        assert_eq!(base.ttl(), Some(100), "第二行为内嵌 TTL");
+        assert!(!base.valid(86_400), "内嵌 TTL 100s 必须优先于全局 86400s");
+
+        // 旧单行格式 → ttl() 为 None，回退全局 TTL
+        std::fs::write(base.as_base_file(), past_timestamp(200)).unwrap();
+        assert_eq!(base.ttl(), None, "旧格式无内嵌 TTL");
+        assert!(base.valid(86_400), "旧格式回退全局 TTL");
+
+        // 第二行损坏 → 同样回退
+        std::fs::write(base.as_base_file(), format!("{}\nnot-a-number", past_timestamp(200)))
+            .unwrap();
+        assert_eq!(base.ttl(), None);
+        assert!(base.valid(86_400));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_time_persists_ttl() {
+        let dir = std::env::temp_dir().join(format!("ofcsi-wttl-{}", std::process::id()));
+        let base = Base(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        base.write_time(Some(7776000)).unwrap();
+        base.read_time().expect("时间戳行必须可解析");
+        assert_eq!(base.ttl(), Some(7776000), "内嵌 TTL 必须持久化");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -269,7 +325,7 @@ mod tests {
         std::fs::create_dir_all(store.bases_dir().join("b1")).unwrap();
         std::fs::create_dir_all(store.bases_dir().join("b2")).unwrap();
         std::fs::write(store.bases_dir().join("not-a-dir"), "x").unwrap();
-        Base(store.bases_dir().join("b1")).write_time().unwrap();
+        Base(store.bases_dir().join("b1")).write_time(None).unwrap();
         // b2 过期
         std::fs::write(
             store.bases_dir().join("b2").join(AS_BASE_FILENAME),
@@ -384,7 +440,7 @@ mod tests {
         let base_dir = store.bases_dir().join("old");
         std::fs::create_dir_all(&base_dir).unwrap();
         std::fs::write(base_dir.join("old-file"), "old").unwrap();
-        Base(base_dir.clone()).write_time().unwrap();
+        Base(base_dir.clone()).write_time(None).unwrap();
 
         // volume：删 old-file（产生 whiteout）、写 new-file
         let vdir = store.volume_dir("v1");
@@ -401,7 +457,7 @@ mod tests {
         // 在合并视图里制造 whiteout：删除 old-file
         std::fs::remove_file(merged.join("old-file")).unwrap();
 
-        let dst = promote_to_base_with_mount(&store, &merged, "newbase").unwrap();
+        let dst = promote_to_base_with_mount(&store, &merged, "newbase", None).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(dst.join("new-file")).unwrap(),
@@ -429,7 +485,7 @@ mod tests {
         // 源数据目录里的用户标记（0 字节）：cp -a 必须不能让它覆盖固化时间戳
         std::fs::write(vdir.join(AS_BASE_FILENAME), "").unwrap();
 
-        let dst = promote_to_base_with_mount(&store, &vdir, "nb2").unwrap();
+        let dst = promote_to_base_with_mount(&store, &vdir, "nb2", Some(7776000)).unwrap();
         assert_eq!(std::fs::read_to_string(dst.join("f")).unwrap(), "1");
         assert!(dst.join(AS_BASE_FILENAME).exists());
         let t = Base(dst.clone())
@@ -438,6 +494,11 @@ mod tests {
         assert!(
             (OffsetDateTime::now_utc() - t).whole_seconds() < 3600,
             "固化后的时间戳必须新鲜（1h 内）"
+        );
+        assert_eq!(
+            Base(dst).ttl(),
+            Some(7776000),
+            "固化必须把卷级 TTL 写入新 base"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

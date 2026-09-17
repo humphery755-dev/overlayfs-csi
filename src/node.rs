@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 use crate::base::{self, Base, Store};
+use crate::controller::VOLUME_ATTR_MAX_AGE;
 use crate::v1;
 
 #[derive(Clone)]
@@ -57,6 +58,23 @@ impl v1::node_server::Node for NodeService {
         let vdir = volume_dir_checked(&req.volume_id, &self.store)?;
         let work = self.store.work_dir(&req.volume_id);
         std::fs::create_dir_all(&work).map_err(internal)?;
+        // 卷级 TTL：PVC 注解经 provision 写入 PV volume_attributes，kubelet 在 stage
+        // 请求的 volume_context 中透传。unstage 请求没有该字段，故持久化到数据目录
+        // 的元文件供 unstage 固化时读取。PV 的 volume_attributes 不可变，元文件不会陈旧。
+        if let Some(v) = match req.volume_context.get(VOLUME_ATTR_MAX_AGE).map(|s| s.parse::<i64>()) {
+            Some(Ok(v)) => Some(v),
+            Some(Err(e)) => {
+                tracing::warn!(
+                    value = req.volume_context.get(VOLUME_ATTR_MAX_AGE).map(String::as_str),
+                    err = %e,
+                    "invalid volume maxAgeSeconds, ignoring"
+                );
+                None
+            }
+            None => None,
+        } {
+            std::fs::write(vdir.join(base::VOLUME_TTL_FILENAME), v.to_string()).map_err(internal)?;
+        }
         let result = match self.store.find_valid_base(self.max_age_s) {
             Ok(Some(base)) => {
                 tracing::info!(base = %base.0.display(), "staging as overlay");
@@ -105,7 +123,24 @@ impl v1::node_server::Node for NodeService {
             match decision {
                 None => {
                     let new_id = uuid::Uuid::new_v4().to_string();
-                    tracing::info!(volume_id = %req.volume_id, base_id = %new_id, "promoting volume to base");
+                    // 卷级 TTL：stage 时持久化在数据目录元文件（unstage 请求无
+                    // volume_context 字段）。缺失/损坏 → 回退全局。
+                    let volume_ttl =
+                        match std::fs::read_to_string(vdir.join(base::VOLUME_TTL_FILENAME)) {
+                            Ok(s) => match s.trim().parse::<i64>() {
+                                Ok(v) => Some(v),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        value = %s,
+                                        err = %e,
+                                        "invalid volume ttl file, falling back to global"
+                                    );
+                                    None
+                                }
+                            },
+                            Err(_) => None,
+                        };
+                    tracing::info!(volume_id = %req.volume_id, base_id = %new_id, ttl = ?volume_ttl, "promoting volume to base");
                     // cp 可能分钟级（无 reflink 的文件系统）：放阻塞线程池，
                     // 不占用 async worker。
                     let this = self.clone();
@@ -113,7 +148,7 @@ impl v1::node_server::Node for NodeService {
                     let vdir = vdir.clone();
                     let lower = mounted_lower.map(base::Base);
                     tokio::task::spawn_blocking(move || {
-                        this.promote(&vid, &vdir, &new_id, lower)
+                        this.promote(&vid, &vdir, &new_id, lower, volume_ttl)
                     })
                     .await
                     .map_err(|e| Status::internal(format!("promote task aborted: {e}")))?
@@ -207,6 +242,7 @@ impl NodeService {
         vdir: &Path,
         new_id: &str,
         lower: Option<Base>,
+        ttl: Option<i64>,
     ) -> anyhow::Result<std::path::PathBuf> {
         match lower {
             Some(b) => {
@@ -223,14 +259,14 @@ impl NodeService {
                         true,
                         &merged,
                     )?;
-                    base::promote_to_base_with_mount(&self.store, &merged, new_id)
+                    base::promote_to_base_with_mount(&self.store, &merged, new_id, ttl)
                 })();
                 let um = base::umount_idempotent(&merged);
                 std::fs::remove_dir_all(&merged)?;
                 um?;
                 outcome
             }
-            None => base::promote_to_base_with_mount(&self.store, vdir, new_id),
+            None => base::promote_to_base_with_mount(&self.store, vdir, new_id, ttl),
         }
     }
 }
@@ -363,7 +399,7 @@ mod tests {
         // 新鲜 base → overlay
         let fresh = store.bases_dir().join("fresh");
         std::fs::create_dir_all(&fresh).unwrap();
-        Base(fresh.clone()).write_time().unwrap();
+        Base(fresh.clone()).write_time(None).unwrap();
         assert_eq!(store.find_valid_base(3600).unwrap(), Some(Base(fresh)));
         std::fs::remove_dir_all(&dir).unwrap();
     }

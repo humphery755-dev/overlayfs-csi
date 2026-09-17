@@ -21,6 +21,32 @@ pub const PV_PREFIX: &str = "overlayfs-";
 pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 pub const MANAGED_BY_VALUE: &str = "overlayfs-csi";
 pub const SELECTED_NODE_ANNOTATION: &str = "volume.kubernetes.io/selected-node";
+/// PVC 注解：覆盖该卷固化出的 base 的 TTL（秒）。缺省回退全局 `--max-age-s`。
+pub const MAX_AGE_ANNOTATION: &str = "overlayfs.csi.k8s.io/max-age-s";
+/// 上述值的透传载体：PV volume_attributes 键，kubelet 会作为 volume_context
+/// 放进 NodeStage/NodeUnstage 请求。
+pub const VOLUME_ATTR_MAX_AGE: &str = "maxAgeSeconds";
+
+/// 解析 PVC 的 max-age-s 注解；缺失返回 None，非法值记录告警并返回 None（回退全局）。
+fn pvc_max_age_override(pvc: &PersistentVolumeClaim) -> Option<i64> {
+    let raw = pvc
+        .metadata
+        .annotations
+        .as_ref()?
+        .get(MAX_AGE_ANNOTATION)?
+        .as_str();
+    match raw.parse::<i64>() {
+        Ok(v) if v > 0 => Some(v),
+        Ok(v) => {
+            tracing::warn!(annotation = MAX_AGE_ANNOTATION, value = v, "must be positive, falling back to global max-age-s");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(annotation = MAX_AGE_ANNOTATION, value = raw, err = %e, "invalid value, falling back to global max-age-s");
+            None
+        }
+    }
+}
 
 pub fn pv_name(pvc_uid: &str) -> String {
     format!("{PV_PREFIX}{pvc_uid}")
@@ -88,6 +114,11 @@ pub fn build_pv(
             csi: Some(CSIPersistentVolumeSource {
                 driver: driver_name.to_string(),
                 volume_handle: name,
+                // 卷级 TTL 经 volume_attributes 透传：kubelet 将其作为 volume_context
+                // 放进 NodeStage/NodeUnstage 请求，固化时写入新 base。
+                volume_attributes: pvc_max_age_override(pvc).map(|v| {
+                    BTreeMap::from([(VOLUME_ATTR_MAX_AGE.to_string(), v.to_string())])
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -398,5 +429,46 @@ status:
         assert_eq!(req.key, "metadata.name");
         assert_eq!(req.operator, "In");
         assert_eq!(req.values.as_ref().unwrap(), &vec!["node1".to_string()]);
+    }
+
+    #[test]
+    fn build_pv_volume_attributes_from_annotation() {
+        // 有注解：透传进 volume_attributes（kubelet 将作为 volume_context 传给 node RPC）
+        let mut pvc = fixture_pvc("u5", "overlayfs.csi.k8s.io", Some("node1"), "Pending");
+        pvc.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(MAX_AGE_ANNOTATION.to_string(), "7776000".to_string());
+        let pv = build_pv(&pvc, "node1", "overlayfs.csi.k8s.io").unwrap();
+        let attrs = pv.spec.as_ref().unwrap().csi.as_ref().unwrap()
+            .volume_attributes
+            .as_ref()
+            .expect("合法注解必须透传进 volume_attributes");
+        assert_eq!(
+            attrs.get(VOLUME_ATTR_MAX_AGE).map(String::as_str),
+            Some("7776000")
+        );
+
+        // 无注解：不写 volume_attributes（固化时回退全局 TTL）
+        let pvc = fixture_pvc("u6", "overlayfs.csi.k8s.io", Some("node1"), "Pending");
+        let pv = build_pv(&pvc, "node1", "overlayfs.csi.k8s.io").unwrap();
+        assert!(
+            pv.spec.as_ref().unwrap().csi.as_ref().unwrap().volume_attributes.is_none(),
+            "无注解不得写 volume_attributes"
+        );
+
+        // 非法注解：不写（回退全局），provision 不失败
+        let mut pvc = fixture_pvc("u7", "overlayfs.csi.k8s.io", Some("node1"), "Pending");
+        pvc.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(MAX_AGE_ANNOTATION.to_string(), "not-a-number".to_string());
+        let pv = build_pv(&pvc, "node1", "overlayfs.csi.k8s.io").unwrap();
+        assert!(
+            pv.spec.as_ref().unwrap().csi.as_ref().unwrap().volume_attributes.is_none(),
+            "非法注解不得写 volume_attributes"
+        );
     }
 }

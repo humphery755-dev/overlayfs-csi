@@ -52,6 +52,8 @@
 
 - base 携带创建时间戳，超过 `--max-age-s`（默认 2592000 秒，即 30 天）后过期。过期 base 会在后台清理，除非仍有 overlay 挂载引用它们。当因此没有任何可用 base 时，下一个卷就从零开始（直到又有卷被固化为 base）。
 
+- TTL 可以按卷覆盖：给 PVC 加注解 `overlayfs.csi.k8s.io/max-age-s: "<秒>"`，该卷固化出的 base 使用该值而非全局值。注解缺失或非法时回退全局 `maxAgeSeconds`。
+
 ### 底层存储
 
 仅支持节点本地存储：base 与每个 PVC 的数据目录都位于 hostPath 存储根（Helm 值 `storageRoot`，默认 `/var/lib/overlayfs-csi`）之下——这也让「卷转 base」可以快速完成。每个节点维护自己的 base，PVC 的数据固定在其供给时所在的节点（见上文）。base 就是该路径下的普通目录，因此驱动 Pod 的重启与重新部署不会丢失它们。
