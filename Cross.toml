@@ -1,2 +1,9 @@
 [target.x86_64-unknown-linux-gnu]
-pre-build = ["apt install -y protobuf-compiler"]
+# Use a custom image with protoc 25.1 preinstalled (see docker/Dockerfile.cross).
+# The stock image is Ubuntu xenial, whose apt only offers protoc 2.6.1 (no proto3),
+# and its container cannot download from github.com over TLS.
+# PROTOC/PROTOC_INCLUDE are set inside the image and read by prost-build (config.rs):
+# it runs $PROTOC with an extra -I $PROTOC_INCLUDE so csi.proto can import
+# the well-known types. cross 0.2.5 has no Cross.toml env-set syntax, so the
+# variables must live in the Dockerfile.
+dockerfile = "docker/Dockerfile.cross"
