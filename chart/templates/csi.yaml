@@ -26,6 +26,10 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "watch"]
+  # VM-like pod：vm_gc_once 全集群 list（活跃判定 + 未注入兜底删除）
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -87,6 +91,11 @@ spec:
             - "--bases={{ .Values.storageRoot }}"
             - "--storage-class={{ .Values.storageClassName | default .Values.name }}"
             - "--max-age-s={{ .Values.maxAgeSeconds | int }}"
+{{- if .Values.webhook.enabled }}
+            - "--webhook-addr=0.0.0.0:{{ .Values.webhook.port }}"
+            - "--webhook-cert=/webhook-cert/tls.crt"
+            - "--webhook-key=/webhook-cert/tls.key"
+{{- end }}
           env:
             - name: KUBE_NODE_NAME
               valueFrom:
@@ -106,6 +115,10 @@ spec:
             - mountPath: /var/lib/kubelet/plugins
               mountPropagation: Bidirectional
               name: plugins-dir
+{{- if .Values.webhook.enabled }}
+            - mountPath: /webhook-cert
+              name: webhook-cert
+{{- end }}
 
       volumes:
         - hostPath:
@@ -128,3 +141,8 @@ spec:
             path: /var/lib/kubelet/plugins_registry
             type: Directory
           name: registration-dir
+{{- if .Values.webhook.enabled }}
+        - secret:
+            secretName: "{{ .Values.name }}-webhook-cert"
+          name: webhook-cert
+{{- end }}

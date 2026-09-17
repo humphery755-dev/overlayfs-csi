@@ -36,8 +36,9 @@ spec:
   terminationGracePeriodSeconds: 1
   containers:
     - name: test
-      image: debian:bullseye-slim
-      command: ["sleep", "infinity"]
+      #image: debian:bullseye-slim
+      image: openresty/openresty:latest
+      #command: ["sleep", "infinity"]
       volumeMounts:
         - name: data
           mountPath: /test
@@ -45,3 +46,25 @@ spec:
     - name: data
       persistentVolumeClaim:
         claimName: demo
+---
+# ── VM 模式示例：一个注解，整个系统目录持久化 ───────────────────
+# pod 打 overlayfs.csi.k8s.io/max-age-s 注解即开启 VM 模式（无需 PVC）：
+#   - 系统目录 /etc /usr /var /opt /root /home /srv 以持久 upperdir 叠加 overlay，
+#     apt install / 改配置的每一次写入直接落盘（无退出写回，SIGKILL/断电不丢已确认写入）
+#   - pod 删除 → 任意久后 apply 同名 pod → 修改原样回来
+#   - 注解值 = pod 删除后快照保留秒数（下面 = 90 天，过期被 GC 清理）
+# 要求：显式 command（wrapper 需转发）；pod 以 privileged 运行（webhook 自动注入）；
+#       主镜像含 sh。限制与语义见 docs/superpowers/specs/2026-09-17-pod-annotation-vm-persistence-design.md
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vm-demo
+  namespace: kube-system
+  annotations:
+    overlayfs.csi.k8s.io/max-age-s: "7776000"
+spec:
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: vm-demo
+      image: debian:bullseye-slim
+      command: ["sleep", "infinity"]

@@ -81,9 +81,17 @@ impl Store {
     pub fn work_dir(&self, volume_id: &str) -> PathBuf {
         self.work_root().join(volume_id)
     }
+    /// VM-like pod 快照根：注解驱动的持久化目录（见 src/webhook.rs 模块文档）
+    pub fn vm_root(&self) -> PathBuf {
+        self.root.join("vm")
+    }
+    /// 单个 VM-like pod 的快照目录：<vm_root>/<namespace>/<pod-name>
+    pub fn vm_dir(&self, namespace: &str, pod_name: &str) -> PathBuf {
+        self.vm_root().join(namespace).join(pod_name)
+    }
     /// Create the storage-root subtrees (idempotent); call once at startup.
     pub fn init(&self) -> anyhow::Result<()> {
-        for d in [self.bases_dir(), self.volumes_dir(), self.work_root()] {
+        for d in [self.bases_dir(), self.volumes_dir(), self.work_root(), self.vm_root()] {
             std::fs::create_dir_all(d)?;
         }
         Ok(())
@@ -261,7 +269,12 @@ mod tests {
         let store = Store::new(&dir);
         store.init().unwrap();
         store.init().unwrap(); // 二次 init 必须幂等成功
-        for d in [store.bases_dir(), store.volumes_dir(), store.work_root()] {
+        for d in [
+            store.bases_dir(),
+            store.volumes_dir(),
+            store.work_root(),
+            store.vm_root(),
+        ] {
             assert!(d.is_dir(), "{} 必须存在", d.display());
         }
         std::fs::remove_dir_all(&dir).unwrap();

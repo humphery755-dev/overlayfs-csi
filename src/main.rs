@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::Parser;
 use overlayfs_csi::v1;
 use tokio::net::UnixListener;
@@ -79,6 +80,28 @@ async fn main_impl(args: Flags) -> anyhow::Result<()> {
     let identity_service = IdentityService {
         name: overlay.name.clone(),
     };
+    // VM-like pod webhook：给了 --webhook-addr 才启用；证书参数缺失启动即失败（原则 11）
+    if let Some(addr) = overlay.webhook_addr {
+        let cert = overlay
+            .webhook_cert
+            .clone()
+            .context("--webhook-cert is required with --webhook-addr")?;
+        let key = overlay
+            .webhook_key
+            .clone()
+            .context("--webhook-key is required with --webhook-addr")?;
+        let flags = overlayfs_csi::webhook::WebhookFlags { addr, cert, key };
+        let webhook_store = store.clone();
+        // 意外退出则进程退出（fast-fail，交给 k8s 重启）；failurePolicy: Ignore 下
+        // 停机期间未注入的 VM pod 由 controller 的 vm_gc_once 兜底删除重建。
+        tokio::spawn(async move {
+            if let Err(e) = overlayfs_csi::webhook::run(flags, webhook_store).await {
+                error!("webhook server exited: {e:#}");
+                std::process::exit(1);
+            }
+        });
+    }
+
     let node_service = overlayfs_csi::node::NodeService {
         node_id: overlay.node.clone(),
         store,

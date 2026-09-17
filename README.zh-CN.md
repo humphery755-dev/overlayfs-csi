@@ -40,6 +40,37 @@
 > [!WARNING]
 > 不要用 generic ephemeral volume（pod spec 中的 `volumeClaimTemplate`）承载需要保留的数据。这类卷背后的 PVC 会随 Pod 一起删除，数据在 Pod 删除时即被销毁——不满足持久化需求。请使用上文所示的独立 PVC。
 
+## VM 模式：一个注解让整个 Pod 像虚拟机一样持久
+
+给 Pod 打上 `overlayfs.csi.k8s.io/max-age-s: "<秒>"` 注解，它就像一台小型虚拟机：容器内的任何修改——`apt install`、改配置——在 Pod 删除重建后原样保留，覆盖整个系统目录树（`/etc`、`/usr`、`/var`、`/opt`、`/root`、`/home`、`/srv`）。无需 PVC：
+
+```yaml
+metadata:
+  name: vm-demo
+  annotations:
+    overlayfs.csi.k8s.io/max-age-s: "7776000"   # 删除后快照保留 90 天
+spec:
+  containers:
+    - name: vm-demo
+      image: debian:bullseye-slim
+      command: ["sleep", "infinity"]   # 必须显式指定 command
+```
+
+chart 部署的 mutating webhook 在 Pod 创建时改写带注解的 Pod：
+
+- 上述每个系统目录都会叠一层 overlay：`upperdir` 位于 hostPath 快照目录（`<storageRoot>/vm/<namespace>/<pod-name>`），镜像内容经 bind mount 固定为 lower 层。每次写入直接落到快照目录的磁盘上——**没有「退出时保存」步骤**，SIGKILL/OOM/断电都不会丢已确认的写入。
+- 重建时重新挂同一批 upperdir：修改全部回来。删除过的文件仍然是删除状态（whiteout 持久）。换了更新的镜像重建时，你的修改依旧叠加在新内容之上。
+- 注解值兼任保留 TTL：Pod 消失后，controller 的 GC 在这么多秒之后删除快照目录。
+- webhook 还会注入 `privileged: true`（mount 的内核要求），并把每个容器的 command 包上一层 init 脚本——脚本完成挂载后 re-exec 你的原命令。
+
+硬性规则（刻意 fail-fast——静默不持久等于静默丢数据）：
+
+- 注解值非法、缺少 `command`、`runAsNonRoot`/非 root uid 的 Pod 会在创建时**被拒绝**，并给出原因。
+- webhook 短暂不可用时（其 `failurePolicy` 为 `Ignore`，普通 Pod 永不受阻），controller 检测到「带注解但未注入」的 VM Pod 会将其删除，重建时即完成注入。
+- 系统目录内出现会被遮蔽的异常挂载点时，init 脚本直接让容器启动失败，绝不静默隐藏。
+
+已知限制：仅普通容器被持久化（initContainer/sidecar 不含）；镜像须含 POSIX `sh`；`/tmp`、`/run` 不持久而 `machine-id`、ssh host keys 持久（VM 语义）；快照在节点本地盘上，多节点集群需要 Pod 重新调度回同一节点。
+
 ### Base 与 `.as_base`
 
 - 只要存在有效的 base，新 stage 的卷就是叠加在其上的 overlay 文件系统；否则从空开始。
@@ -123,9 +154,9 @@ $ kubectl apply -f pod.yaml      # 数天后：同名 PVC 复用，所有变更�
 
 ## 实现细节
 
-- 单个 Rust 二进制实现 Identity 与 Node CSI 服务（外加一个 Controller 桩——其 RPC 全部 unimplemented，供给刻意绕过 CSI Controller 服务，见下文）。kubelet 通过 UNIX socket 与 Node 服务通信。
+- 单个 Rust 二进制实现 Identity 与 Node CSI 服务（外加一个 Controller 桩——其 RPC 全部 unimplemented，供给刻意绕过 CSI Controller 服务，见下文）。kubelet 通过 UNIX socket 与 Node 服务通信。同一二进制还托管 VM 模式的 admission webhook（HTTPS，`--webhook-addr/--webhook-cert/--webhook-key`）。
 - 以 DaemonSet 在每个节点运行一个实例，遵循 Kubernetes CSI 设计。`CSIDriver` 对象只声明 `Persistent` 卷生命周期模式（不支持 inline ephemeral 卷），Node 能力通告 `STAGE_UNSTAGE_VOLUME`。
-- 每个实例拥有一个 hostPath 存储根（`--bases` 参数，即 `storageRoot` 值），其下三个子目录：`bases/`（共享只读 base 树）、`volumes/<pv-name>/`（每 PVC 数据目录）、`work/<pv-name>/`（overlay work 目录）。
+- 每个实例拥有一个 hostPath 存储根（`--bases` 参数，即 `storageRoot` 值），其下四个子目录：`bases/`（共享只读 base 树）、`volumes/<pv-name>/`（每 PVC 数据目录）、`work/<pv-name>/`（overlay work 目录）、`vm/<namespace>/<pod-name>/`（VM 模式快照目录，内含记录 `{ttl_s, last_seen}` 的 `meta.json`）。
 - 供给不经过 CSI Controller 服务，而是由每个节点实例内的控制循环 watch 全部 PVC 完成：
   - 满足以下条件的 PVC（处于 `Pending`、`storageClassName` 与本驱动的 StorageClass 匹配、`volume.kubernetes.io/selected-node` 注解等于本节点）会得到预绑定 PV `overlayfs-<pvc-uid>`（带 `app.kubernetes.io/managed-by: overlayfs-csi` 标签、回收策略 `Delete`、nodeAffinity 锁定本节点）。该操作幂等，并有 30 秒的 reconcile 循环在重启后重放。
   - PVC 被删除会触发删除对应 PV，并移除本节点上相应的数据目录与 work 目录。
@@ -138,9 +169,11 @@ $ kubectl apply -f pod.yaml      # 数天后：同名 PVC 复用，所有变更�
   - base TTL 清理：超过_有效_ TTL 的 base 会被移除——有效 TTL 取 base 内嵌的卷级值，无内嵌则取全局 `--max-age-s`；除非 `/proc/self/mountinfo` 显示仍有 overlay 挂载的 `lowerdir` 指向它们（通过解析 mountinfo 做引用检测）。
   - 孤儿 GC：没有对应 managed PV 的 `volumes/` 目录——且超过 5 分钟宽限期——会被移除；`work/` 目录在其对应卷目录不存在时同样被移除。
 - 若某次 `/proc/self/mountinfo` 快照解析出零个 overlay 挂载，janitor 会记录告警并跳过整轮清理——因为此时的引用检查无法保证不会静默放行。
+- janitor 同时承担 VM 模式 GC（`vm_gc_once`，不依赖 mountinfo）：带 VM 注解但缺少注入卷的 Pod（webhook 停机期间建成）会被删除以便重建时注入；活跃 VM Pod 的快照目录会刷新 `last_seen`；无活跃 Pod 的快照目录在其记录的 TTL 届满后删除——`meta.json` 缺失或损坏时保守保留该目录。
 
 ## TODO
 
 - 通过 Pod 状态（而非 `.as_base` 标记）推断卷能否用作 base（见上文）。
 - 支持其他底层存储（见上文）。
 - 通过标签区分不同类别的 base。
+- VM 模式跨节点：记录 Pod 快照所在的节点（如节点注解）并把重建的 Pod 钉回该节点，取代目前的单节点调度假设。

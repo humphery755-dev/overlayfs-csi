@@ -1,6 +1,7 @@
 pub mod base;
 pub mod controller;
 pub mod node;
+pub mod webhook;
 
 /// 上游 csi.proto（构建时下载）经 tonic-build 生成的代码，不满足 clippy
 /// （doc_overindented_list_items / result_large_err），仅对生成模块豁免。
@@ -18,7 +19,7 @@ pub struct OverlayFlags {
     pub name: String,
     #[clap(long, alias = "nodeid")]
     pub node: String,
-    /// Host storage root containing bases/, volumes/, work/
+    /// Host storage root containing bases/, volumes/, work/, vm/
     #[clap(long)]
     pub bases: std::path::PathBuf,
     /// StorageClass name this driver provisions for
@@ -27,4 +28,13 @@ pub struct OverlayFlags {
     /// Maximum age of a base (seconds) before cleanup
     #[clap(long)]
     pub max_age_s: i64,
+    /// VM-like pod webhook listen address (e.g. 0.0.0.0:9443); disabled when unset
+    #[clap(long)]
+    pub webhook_addr: Option<std::net::SocketAddr>,
+    /// TLS certificate PEM for the webhook (required with --webhook-addr)
+    #[clap(long)]
+    pub webhook_cert: Option<std::path::PathBuf>,
+    /// TLS private key PEM for the webhook (required with --webhook-addr)
+    #[clap(long)]
+    pub webhook_key: Option<std::path::PathBuf>,
 }

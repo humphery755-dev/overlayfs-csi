@@ -12,3 +12,13 @@ storageRoot: /var/lib/overlayfs-csi
 # 86400=1 天；2592000=30 天（下例）。
 # 可被 PVC 注解 overlayfs.csi.k8s.io/max-age-s 逐卷覆盖。
 maxAgeSeconds: 2592000
+
+# VM-like pod：pod 打 overlayfs.csi.k8s.io/max-age-s 注解即开启 VM 模式——
+# 系统目录（/etc /usr /var /opt /root /home /srv）以持久 upperdir 叠加 overlay，
+# 写入穿透落盘；pod 删除重建后 apt 装的软件、改的配置原样回来。
+# 注解值 = pod 删除后快照保留秒数（过期由 GC 清理）。
+webhook:
+  enabled: true
+  port: 9443
+  # vm-init.sh 所在 ConfigMap 名；勿改（src/webhook.rs::VM_CONFIGMAP 与此对应）
+  configMapName: overlayfs-csi-vm-init

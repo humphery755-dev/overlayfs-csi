@@ -40,6 +40,37 @@ This repository also provides an example for building Kubernetes CSIs in Rust.
 > [!WARNING]
 > Do not use generic ephemeral volumes (`volume.csi` with a `volumeClaimTemplate` in the pod spec) with this driver for anything you want to keep. Such volumes are backed by a PVC that is deleted together with the pod, so their data is destroyed on pod deletion — they do not satisfy persistence needs. Use a standalone PVC as above.
 
+## VM mode: pod-wide persistence via a single annotation
+
+Annotate a pod with `overlayfs.csi.k8s.io/max-age-s: "<seconds>"` and it behaves like a small VM: anything you change inside the container — `apt install`, edited configs — persists across pod deletion and recreation, for the whole system tree (`/etc`, `/usr`, `/var`, `/opt`, `/root`, `/home`, `/srv`). No PVC required:
+
+```yaml
+metadata:
+  name: vm-demo
+  annotations:
+    overlayfs.csi.k8s.io/max-age-s: "7776000"   # keep the snapshot for 90 days after deletion
+spec:
+  containers:
+    - name: vm-demo
+      image: debian:bullseye-slim
+      command: ["sleep", "infinity"]   # an explicit command is required
+```
+
+A mutating webhook (deployed by the chart) rewrites annotated pods at creation time:
+
+- Each system directory above is layered with an overlay whose `upperdir` lives in a hostPath snapshot dir (`<storageRoot>/vm/<namespace>/<pod-name>`); the image content is pinned as the lower layer via a bind mount. Every write goes straight to disk in the snapshot dir — **there is no save-on-exit step**, so SIGKILL/OOM/power loss cannot lose confirmed writes.
+- On recreation the same upperdirs are mounted again: your changes are back. Deleted files stay deleted (whiteouts persist). Recreating with a newer image keeps your changes layered on top of the new content.
+- The annotation value doubles as the retention TTL: after the pod is gone, the controller's GC removes the snapshot dir once this many seconds have passed.
+- The webhook also injects `privileged: true` (mounting requires it) and wraps each container's command with a small init script that performs the mounts and then re-execs your command.
+
+Hard rules (fail-fast by design — silent non-persistence would mean silent data loss):
+
+- An invalid annotation value, a missing `command`, or `runAsNonRoot`/non-root-uid pods are **refused at creation** with an explanatory message.
+- If the webhook is briefly unavailable (its `failurePolicy` is `Ignore`, so ordinary pods are never blocked), the controller detects VM pods that were created without injection and deletes them so they are recreated with injection.
+- Unusual mount points inside the system directories (they would be shadowed) make the init script fail the container at startup instead of hiding them.
+
+Known limits: only plain containers are persisted (not initContainers/sidecars); the image must contain a POSIX `sh`; `/tmp` and `/run` are not persisted while `machine-id` and ssh host keys are (VM semantics); snapshots are node-local, so multi-node clusters need the pod to be rescheduled onto the same node.
+
 ### Bases and `.as_base`
 
 - Whenever a valid base is available, a newly staged volume is an overlay filesystem on top of it. Otherwise, it starts empty.
@@ -123,9 +154,9 @@ $ kubectl apply -f pod.yaml      # days later: same PVC reused, all changes are 
 
 ## Implementation details
 
-- A single Rust binary implements the Identity and Node CSI services (plus a Controller stub whose RPCs are all unimplemented — provisioning deliberately bypasses the CSI Controller service, see below). Kubelet communicates with the Node service using a UNIX socket.
+- A single Rust binary implements the Identity and Node CSI services (plus a Controller stub whose RPCs are all unimplemented — provisioning deliberately bypasses the CSI Controller service, see below). Kubelet communicates with the Node service using a UNIX socket. The same binary hosts the VM-mode admission webhook (HTTPS, `--webhook-addr/--webhook-cert/--webhook-key`).
 - A daemonset runs one such server per node, following the Kubernetes CSI design. The `CSIDriver` object advertises only the `Persistent` volume lifecycle mode (inline ephemeral volumes are not supported) and the `STAGE_UNSTAGE_VOLUME` node capability.
-- Each server has a hostPath storage root (`--bases`, the `storageRoot` value) with three subdirectories: `bases/` (shared read-only base trees), `volumes/<pv-name>/` (per-PVC data directories) and `work/<pv-name>/` (overlay work directories).
+- Each server has a hostPath storage root (`--bases`, the `storageRoot` value) with four subdirectories: `bases/` (shared read-only base trees), `volumes/<pv-name>/` (per-PVC data directories), `work/<pv-name>/` (overlay work directories) and `vm/<namespace>/<pod-name>/` (VM-mode snapshot dirs with a `meta.json` recording `{ttl_s, last_seen}`).
 - Provisioning is not done through the CSI Controller service, but by a controller loop in each node's server that watches all PVCs:
   - A PVC that is `Pending`, whose `storageClassName` matches this node's StorageClass and whose `volume.kubernetes.io/selected-node` annotation equals this node gets a pre-bound PV `overlayfs-<pvc-uid>` (labelled `app.kubernetes.io/managed-by: overlayfs-csi`, reclaim policy `Delete`, node affinity to this node). The operation is idempotent, and a 30 s reconcile loop replays it after restarts.
   - A deleted PVC triggers deletion of its PV and removal of the corresponding data and work directories on this node.
@@ -138,9 +169,11 @@ $ kubectl apply -f pod.yaml      # days later: same PVC reused, all changes are 
   - Base TTL cleanup: bases older than their *effective* TTL — the per-volume value embedded in the base, or the global `--max-age-s` when it has none — are removed, unless `/proc/self/mountinfo` shows an overlay mount whose `lowerdir` still points at them (reference detection by parsing mountinfo).
   - Orphan GC: `volumes/` directories without a matching managed PV — and older than a 5 minute grace period — are removed, as are `work/` directories whose volume directory no longer exists.
 - If a snapshot of `/proc/self/mountinfo` parses to zero overlay mounts, the janitor logs a warning and skips the entire cleanup round, since the reference checks could not be trusted not to silently pass.
+- The janitor also runs the VM-mode GC (`vm_gc_once`, independent of mountinfo): pods carrying the VM annotation but missing the injected volumes (webhook was down, `failurePolicy: Ignore`) are deleted so they get recreated with injection; snapshot dirs of active VM pods get their `last_seen` refreshed; snapshot dirs without an active pod are removed once their recorded TTL has elapsed — a missing or corrupt `meta.json` makes the dir conservatively kept.
 
 ## TODOs
 
 - Deduce whether a volume can be used as base from the pod status (see above).
 - Support other underlying storages (see above).
 - Allow different categories of bases with labels.
+- VM mode across nodes: record which node holds a pod's snapshot (e.g. node annotations) and pin recreated pods there, instead of relying on single-node scheduling.
