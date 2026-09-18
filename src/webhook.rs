@@ -64,8 +64,10 @@ rm -rf "$KEEP"
 mkdir -p "$KEEP"
 : > "$KEEP/submounts"
 for d in $DIRS; do
-  # 第 1 列 = 挂载点路径的斜杠深度；浅→深排序保证 bind 回时父路径先就位
-  awk -v pre="/$d/" 'index($5, pre) == 1 { n = gsub(/\//, "/", $5); print n "\t" $5 }' \
+  # 匹配白名单目录自身及其下所有子路径（mountPath: /var 整目录挂载也算用户
+  # 挂载，必须排除，否则 overlay 会遮蔽它）。第 1 列 = 斜杠深度；浅→深排序
+  # 保证 bind 回时父路径先就位。
+  awk -v d="/$d" '$5 == d || index($5, d "/") == 1 { n = gsub(/\//, "/", $5); print n "\t" $5 }' \
     /proc/self/mountinfo >> "$KEEP/submounts"
 done
 sort -n -u "$KEEP/submounts" -o "$KEEP/submounts"
@@ -863,6 +865,48 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("mnt/usr/app.txt")).unwrap(), "image");
         unstack();
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// mountPath 恰好是白名单目录自身（如 volumeMount 到 /var）时同样必须排除：
+    /// 用户显式接管整个目录，overlay 挂上后被用户的挂载完全遮蔽（无害），
+    /// 但绝不能反向遮蔽用户的数据。
+    #[test]
+    fn self_mount_is_excluded_from_snapshot() {
+        if !require_root() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ofcsi-vm-self-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in [
+            "lower/usr", "up/usr", "work/usr", "bind/usr", "mnt/usr", "real-data", "tmp-keep",
+        ] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::write(dir.join("lower/usr/app.txt"), "image").unwrap();
+        std::fs::write(dir.join("real-data/userfile"), "user-data").unwrap();
+
+        let sh = |cmd: &str| {
+            let out = duct::cmd!("sh", "-c", cmd).dir(&dir).run().expect("sh failed");
+            assert!(out.status.success(), "{cmd} failed: {}", String::from_utf8_lossy(&out.stderr));
+        };
+
+        // kubelet 把用户卷挂到白名单目录自身（mnt/usr），随后三阶段排除
+        sh("mount --bind real-data mnt/usr");
+        sh("mount --bind mnt/usr tmp-keep");
+        sh("mount --bind lower bind && mount -t overlay overlay -o lowerdir=bind,upperdir=up,workdir=work mnt/usr");
+        sh("mount --bind tmp-keep mnt/usr");
+
+        // 访问 /usr 看到的是用户卷；写入直达用户卷，不进快照
+        assert_eq!(std::fs::read_to_string(dir.join("mnt/usr/userfile")).unwrap(), "user-data");
+        std::fs::write(dir.join("mnt/usr/newfile"), "user").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("real-data/newfile")).unwrap(), "user");
+        assert!(
+            std::fs::read_dir(dir.join("up/usr")).unwrap().next().is_none(),
+            "整目录挂载时 overlay 不得捕获任何写入"
+        );
+
+        sh("umount mnt/usr && umount mnt/usr && umount bind && umount mnt/usr");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
