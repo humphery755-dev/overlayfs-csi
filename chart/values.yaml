@@ -14,7 +14,7 @@ storageRoot: /var/lib/overlayfs-csi
 maxAgeSeconds: 2592000
 
 # VM-like pod：pod 打 overlayfs.csi.k8s.io/max-age-s 注解即开启 VM 模式——
-# 系统目录（/etc /usr /var /opt /root /home /srv）以持久 upperdir 叠加 overlay，
+# 系统目录白名单（以持久 upperdir 叠加 overlay，唯一真源见 src/vm-init.sh 的 DIRS）
 # 写入穿透落盘；pod 删除重建后 apt 装的软件、改的配置原样回来。
 # 注解值 = pod 删除后快照保留秒数（过期由 GC 清理）。
 webhook:

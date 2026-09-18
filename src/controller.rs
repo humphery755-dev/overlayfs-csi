@@ -6,7 +6,7 @@ use anyhow::Context;
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{
     CSIPersistentVolumeSource, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
-    ObjectReference, PersistentVolume, PersistentVolumeClaim, PersistentVolumeSpec, Pod,
+    ObjectReference, PersistentVolume, PersistentVolumeClaim, PersistentVolumeSpec,
     VolumeNodeAffinity,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -15,14 +15,16 @@ use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use kube::runtime::watcher;
 use kube::Client;
 
-use crate::base::{is_referenced_in, overlay_lowerdirs, remove_dir_all_if_exists, Store};
+use crate::base::{
+    is_referenced_in, overlay_lowerdirs, parse_max_age_s, remove_dir_all_if_exists, Store,
+    MAX_AGE_ANNOTATION,
+};
 
 pub const PV_PREFIX: &str = "overlayfs-";
 pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 pub const MANAGED_BY_VALUE: &str = "overlayfs-csi";
 pub const SELECTED_NODE_ANNOTATION: &str = "volume.kubernetes.io/selected-node";
-/// PVC 注解：覆盖该卷固化出的 base 的 TTL（秒）。缺省回退全局 `--max-age-s`。
-pub const MAX_AGE_ANNOTATION: &str = "overlayfs.csi.k8s.io/max-age-s";
+// MAX_AGE_ANNOTATION 已上提到 crate::base（PVC 与 Pod 两域共享的 wire 契约）。
 /// 上述值的透传载体：PV volume_attributes 键，kubelet 会作为 volume_context
 /// 放进 NodeStage/NodeUnstage 请求。
 pub const VOLUME_ATTR_MAX_AGE: &str = "maxAgeSeconds";
@@ -35,14 +37,11 @@ fn pvc_max_age_override(pvc: &PersistentVolumeClaim) -> Option<i64> {
         .as_ref()?
         .get(MAX_AGE_ANNOTATION)?
         .as_str();
-    match raw.parse::<i64>() {
-        Ok(v) if v > 0 => Some(v),
-        Ok(v) => {
-            tracing::warn!(annotation = MAX_AGE_ANNOTATION, value = v, "must be positive, falling back to global max-age-s");
-            None
-        }
-        Err(e) => {
-            tracing::warn!(annotation = MAX_AGE_ANNOTATION, value = raw, err = %e, "invalid value, falling back to global max-age-s");
+    // 失败处置（warn+回退全局）是 PVC 域的策略；解析规则共享自 crate::base。
+    match parse_max_age_s(raw) {
+        Ok(v) => Some(v),
+        Err(msg) => {
+            tracing::warn!(annotation = MAX_AGE_ANNOTATION, value = raw, "{msg}; falling back to global max-age-s");
             None
         }
     }
@@ -154,12 +153,17 @@ impl Controller {
                 );
                 loop {
                     janitor.tick().await;
-                    if let Err(e) = this.cleanup_once().await {
+                    // VM GC 不依赖 mountinfo（mountinfo 解析异常不拖累它），
+                    // 且与 cleanup_once 操作互不相交的目录树——并行执行，
+                    // 一方慢/错不拖延另一方（错误各自记录，故障隔离）。
+                    let (r1, r2) = tokio::join!(
+                        this.cleanup_once(),
+                        crate::webhook::vm_gc_once(&this.kube, &this.store)
+                    );
+                    if let Err(e) = r1 {
                         tracing::error!("cleanup/GC failed: {e:#}");
                     }
-                    // VM GC 与 cleanup_once 分开执行：它不依赖 mountinfo，
-                    // mountinfo 解析异常不应拖累 VM 快照目录的 GC 与兜底检测。
-                    if let Err(e) = this.vm_gc_once().await {
+                    if let Err(e) = r2 {
                         tracing::error!("VM GC failed: {e:#}");
                     }
                 }
@@ -295,71 +299,6 @@ impl Controller {
         let work_root = self.store.work_root();
         if work_root.exists() {
             self.gc_orphans(&work_root, &mounts, &|n| self.store.volume_dir(n).exists())?;
-        }
-        Ok(())
-    }
-
-    /// VM-like pod 快照 GC + 未注入兜底（机制见 src/webhook.rs 与设计文档）。
-    /// 活跃 pod 的目录只刷 last_seen；失去活跃 pod 的目录按其 meta 的 TTL 过期删除；
-    /// meta 缺失/损坏一律保守跳过（宁可少删，不可误删用户数据）。
-    pub async fn vm_gc_once(&self) -> anyhow::Result<()> {
-        let pods: Api<Pod> = Api::all(self.kube.clone());
-        let list = pods.list(&ListParams::default()).await?;
-        let mut active: HashSet<(String, String)> = HashSet::new();
-        for pod in &list.items {
-            let Some(ns) = pod.metadata.namespace.clone() else {
-                continue;
-            };
-            let Some(name) = pod.metadata.name.clone() else {
-                continue;
-            };
-            if crate::webhook::vm_ttl(pod).is_none() {
-                continue;
-            }
-            if !crate::webhook::is_vm_injected(pod) {
-                // webhook 失效期（failurePolicy: Ignore）建成的 pod 静默失去持久化——
-                // 放行等于数据丢失，删除强制重走注入（fail fast）。
-                tracing::warn!(ns, name, "VM pod was not injected (webhook down?); deleting so it is recreated with injection");
-                let api: Api<Pod> = Api::namespaced(self.kube.clone(), &ns);
-                api.delete(&name, &DeleteParams::default()).await?;
-                continue;
-            }
-            active.insert((ns, name));
-        }
-
-        let now = crate::webhook::now_unix();
-        let vm_root = self.store.vm_root();
-        if !vm_root.exists() {
-            return Ok(());
-        }
-        for ns_entry in std::fs::read_dir(&vm_root)? {
-            let ns_entry = ns_entry?;
-            if !ns_entry.file_type()?.is_dir() {
-                continue;
-            }
-            let ns = ns_entry.file_name().to_string_lossy().into_owned();
-            for vm_entry in std::fs::read_dir(ns_entry.path())? {
-                let vm_entry = vm_entry?;
-                if !vm_entry.file_type()?.is_dir() {
-                    continue;
-                }
-                let name = vm_entry.file_name().to_string_lossy().into_owned();
-                if active.contains(&(ns.clone(), name.clone())) {
-                    crate::webhook::touch_meta(&vm_entry.path(), now)?;
-                    continue;
-                }
-                let Some(meta) = crate::webhook::read_meta(&vm_entry.path())? else {
-                    tracing::warn!(
-                        dir = %vm_entry.path().display(),
-                        "VM dir missing/corrupt meta.json; skipping this round"
-                    );
-                    continue;
-                };
-                if crate::webhook::vm_expired(meta.ttl_s, meta.last_seen, now) {
-                    tracing::warn!(dir = %vm_entry.path().display(), "removing expired VM snapshot dir");
-                    std::fs::remove_dir_all(vm_entry.path())?;
-                }
-            }
         }
         Ok(())
     }

@@ -32,9 +32,9 @@ pub struct OverlayFlags {
     #[clap(long)]
     pub webhook_addr: Option<std::net::SocketAddr>,
     /// TLS certificate PEM for the webhook (required with --webhook-addr)
-    #[clap(long)]
+    #[clap(long, requires = "webhook_addr")]
     pub webhook_cert: Option<std::path::PathBuf>,
     /// TLS private key PEM for the webhook (required with --webhook-addr)
-    #[clap(long)]
+    #[clap(long, requires = "webhook_addr")]
     pub webhook_key: Option<std::path::PathBuf>,
 }

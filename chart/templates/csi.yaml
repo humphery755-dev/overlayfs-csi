@@ -29,7 +29,7 @@ rules:
   # VM-like pod：vm_gc_once 全集群 list（活跃判定 + 未注入兜底删除）
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "delete"]
+    verbs: ["list", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -143,6 +143,6 @@ spec:
           name: registration-dir
 {{- if .Values.webhook.enabled }}
         - secret:
-            secretName: "{{ .Values.name }}-webhook-cert"
+            secretName: "{{ include "overlayfs-csi.webhookSecretName" . }}"
           name: webhook-cert
 {{- end }}

@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Context;
 use clap::Parser;
 use overlayfs_csi::v1;
 use tokio::net::UnixListener;
@@ -80,17 +79,20 @@ async fn main_impl(args: Flags) -> anyhow::Result<()> {
     let identity_service = IdentityService {
         name: overlay.name.clone(),
     };
-    // VM-like pod webhook：给了 --webhook-addr 才启用；证书参数缺失启动即失败（原则 11）
+    // VM-like pod webhook：给了 --webhook-addr 才启用；clap 的 requires 属性
+    // 保证 cert/key 与 addr 同现（缺参在参数解析期即报错）
     if let Some(addr) = overlay.webhook_addr {
-        let cert = overlay
-            .webhook_cert
-            .clone()
-            .context("--webhook-cert is required with --webhook-addr")?;
-        let key = overlay
-            .webhook_key
-            .clone()
-            .context("--webhook-key is required with --webhook-addr")?;
-        let flags = overlayfs_csi::webhook::WebhookFlags { addr, cert, key };
+        let flags = overlayfs_csi::webhook::WebhookFlags {
+            addr,
+            cert: overlay
+                .webhook_cert
+                .clone()
+                .expect("clap requires=webhook_addr"),
+            key: overlay
+                .webhook_key
+                .clone()
+                .expect("clap requires=webhook_addr"),
+        };
         let webhook_store = store.clone();
         // 意外退出则进程退出（fast-fail，交给 k8s 重启）；failurePolicy: Ignore 下
         // 停机期间未注入的 VM pod 由 controller 的 vm_gc_once 兜底删除重建。

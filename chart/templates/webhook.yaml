@@ -7,9 +7,9 @@
 
 # 自签证书：helm 安装时生成，upgrade 时 lookup 复用已存在的（否则 apiserver 端
 # caBundle 与服务端证书会失配）。
-{{- $svcName := printf "%s-webhook" (.Values.name | replace "." "-") }}
+{{- $svcName := include "overlayfs-csi.webhookSvcName" . }}
 {{- $svc := printf "%s.%s.svc" $svcName .Values.namespace }}
-{{- $secretName := printf "%s-webhook-cert" .Values.name }}
+{{- $secretName := include "overlayfs-csi.webhookSecretName" . }}
 {{- $existing := lookup "v1" "Secret" .Values.namespace $secretName }}
 {{- $ca := "" }}
 {{- $key := "" }}
@@ -41,12 +41,6 @@ spec:
     app: "{{ .Values.name }}"
   ports:
     - port: {{ .Values.webhook.port }}
-      targetPort: {{ .Values.webhook.port }}
----
-# vm-init.sh 不再走 ConfigMap：webhook 把脚本直接写进每份快照卷根
-# （<storageRoot>/vm/<ns>/<pod>/vm-init.sh），随 hostPath 卷挂载进容器。
-# ConfigMap 是 namespace 域资源，曾导致其他 namespace 的 VM pod
-# 卡在 FailedMount（configmap not found）；见 src/webhook.rs::VM_INIT_SCRIPT。
 ---
 # failurePolicy: Ignore——webhook 停机不得拖累普通 pod 创建；带注解的 pod 会被
 # controller 的 vm_gc_once 兜底删除重建（静默不持久 = 数据丢失，绝不放行）。

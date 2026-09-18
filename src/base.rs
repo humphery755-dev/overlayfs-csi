@@ -8,6 +8,19 @@ pub const AS_BASE_FILENAME: &str = ".as_base";
 /// 卷级 TTL 元文件：stage 时由 volume_context 写入，unstage 固化时读取。
 /// NodeUnstageVolumeRequest 没有 volume_context 字段，无法像 stage 一样透传。
 pub const VOLUME_TTL_FILENAME: &str = ".ofcsi-max-age-s";
+/// 跨域共享的 TTL 注解名：打在 PVC 上覆盖固化 base 的 TTL；打在 Pod 上开启
+/// VM 模式并兼任快照保留 TTL。两处的失败处置刻意不同（PVC warn+回退全局，
+/// Pod 拒绝创建），但解析规则只有下面这一份。
+pub const MAX_AGE_ANNOTATION: &str = "overlayfs.csi.k8s.io/max-age-s";
+
+/// 共享的注解值解析：正整数才合法。
+pub fn parse_max_age_s(raw: &str) -> Result<i64, String> {
+    match raw.parse::<i64>() {
+        Ok(v) if v > 0 => Ok(v),
+        Ok(v) => Err(format!("must be a positive integer, got {v}")),
+        Err(e) => Err(format!("must be a positive integer, got {raw:?} ({e})")),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Base(pub PathBuf);
@@ -96,19 +109,47 @@ impl Store {
         }
         Ok(())
     }
-    pub fn list_bases(&self) -> anyhow::Result<Vec<Base>> {
-        let mut bases = Vec::new();
-        for entry in std::fs::read_dir(self.bases_dir())? {
+    /// 列出 path 下的子目录——目录遍历的唯一惯例（bases、vm 布局共用）。
+    /// path 不存在时返回错误；调用方视场景决定是冷状态放行还是上抛。
+    pub fn list_dirs(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+        let mut dirs = Vec::new();
+        for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
-                bases.push(Base(entry.path()));
+                dirs.push(entry.path());
             }
         }
-        Ok(bases)
+        Ok(dirs)
+    }
+
+    pub fn list_bases(&self) -> anyhow::Result<Vec<Base>> {
+        Ok(Self::list_dirs(&self.bases_dir())?.into_iter().map(Base).collect())
     }
 
     pub fn find_valid_base(&self, max_age_s: i64) -> anyhow::Result<Option<Base>> {
         Ok(self.list_bases()?.into_iter().find(|b| b.valid(max_age_s)))
+    }
+
+    /// vm/ 布局的唯一遍历点：返回全部快照目录的 (namespace, pod-name)。
+    /// vm 根不存在（冷节点）时返回空。
+    pub fn list_vm_dirs(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        let Ok(ns_dirs) = Self::list_dirs(&self.vm_root()) else {
+            return Ok(out);
+        };
+        for ns_dir in ns_dirs {
+            let Some(ns_name) = ns_dir.file_name() else {
+                continue;
+            };
+            let ns = ns_name.to_string_lossy().into_owned();
+            for vm_dir in Self::list_dirs(&ns_dir)? {
+                let Some(name) = vm_dir.file_name() else {
+                    continue;
+                };
+                out.push((ns.clone(), name.to_string_lossy().into_owned()));
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -239,6 +280,21 @@ pub fn promote_to_base_with_mount(
             Err(e)
         }
     }
+}
+
+/// 非 root 环境自动 skip（集成测试需要真实 mount）；base 与 webhook 的
+/// root-gated 测试共用。
+#[cfg(test)]
+pub(crate) fn require_root() -> bool {
+    let ok = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| o.stdout == b"0\n")
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("skipping: requires root");
+    }
+    ok
 }
 
 #[cfg(test)]
@@ -403,18 +459,7 @@ mod tests {
         assert_eq!(mounted_lower_in(&mounts, "/mnt/absent"), None);
     }
 
-    /// 非 root 环境自动 skip（集成测试需要真实 mount）。
-    fn require_root() -> bool {
-        let ok = std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .map(|o| o.stdout == b"0\n")
-            .unwrap_or(false);
-        if !ok {
-            eprintln!("skipping: requires root");
-        }
-        ok
-    }
+    // require_root 在模块级（cfg(test)），base 与 webhook 的 root 测试共用。
 
     #[test]
     fn overlay_mount_unmount_roundtrip() {

@@ -8,6 +8,7 @@
 //! 设计与错误处理矩阵见
 //! docs/superpowers/specs/2026-09-17-pod-annotation-vm-persistence-design.md。
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,95 +18,35 @@ use base64::Engine;
 use hyper::service::service_fn;
 use hyper::{Body, Method, Request, Response, StatusCode};
 use k8s_openapi::api::core::v1::Pod;
+use kube::api::{Api, DeleteParams, ListParams};
+use kube::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::base::Store;
-use crate::controller::MAX_AGE_ANNOTATION;
+use crate::base::{parse_max_age_s, Store, MAX_AGE_ANNOTATION};
 
 pub const VM_VOLUME_NAME: &str = "ofcsi-vm";
-/// hostPath 快照卷在容器内的挂载点；wrapper 脚本也随卷分发（写在卷根）
+/// hostPath 快照卷在容器内的挂载点；wrapper 脚本也随卷分发（写在卷根）。
+/// 脚本内 BASE 从自身位置推导（`dirname $0`），此处为该路径的唯一硬编码点。
 pub const VM_DIR: &str = "/.ofcsi-vm";
-/// wrapper 脚本：由 [`ensure_vm_dir`] 写进快照卷根，随 hostPath 卷挂载进容器。
-/// 不走 ConfigMap——ConfigMap 是 namespace 域资源，会让其他 namespace 的 VM pod
-/// 卡在 FailedMount（「任意 namespace 打注解即用」是 VM 模式的硬承诺）。
+/// wrapper 脚本文件名与容器内完整路径：由 [`ensure_vm_dir`] 写进快照卷根，
+/// 随 hostPath 卷挂载进容器。不走 ConfigMap——ConfigMap 是 namespace 域资源，
+/// 会让其他 namespace 的 VM pod 卡在 FailedMount（「任意 namespace 打注解
+/// 即用」是 VM 模式的硬承诺）。
+pub const VM_INIT_FILE: &str = "vm-init.sh";
 pub const VM_INIT: &str = "/.ofcsi-vm/vm-init.sh";
-/// 注入成功标记：watcher 兜底检测依据——带 VM 注解却没有本标记 = webhook 失效期
-/// 建成的 pod（静默不持久 = 数据丢失风险），删除重建。
-pub const VM_INJECTED_ANNOTATION: &str = "overlayfs.csi.k8s.io/vm-injected";
 
 pub const META_FILE: &str = "meta.json";
 
-/// vm-init.sh 全文：随快照卷分发（[`ensure_vm_dir`] 落盘），每次注入都重写——
-/// 驱动升级后新注入的 pod 自动用上新脚本。
+/// vm-init.sh 全文（`src/vm-init.sh`，编译期嵌入）：随快照卷分发
+/// （[`ensure_vm_dir`] 落盘），每次注入都重写——驱动升级后新注入的 pod
+/// 自动用上新脚本。
 ///
-/// 用户挂载语义（与普通 pod 一致）：白名单目录下已存在的挂载点（用户的
-/// hostPath/PVC/emptyDir，以及 kubelet 注入的 hosts/hostname/resolv.conf）
-/// 一律「排除」在 overlay 之外——bind 到容器私有中转位，overlay 挂好后按
+/// 用户挂载语义（与普通 pod 一致）：白名单目录下已存在的挂载点一律
+/// 「排除」在 overlay 之外——bind 到容器私有中转位，overlay 挂好后按
 /// 浅→深 bind 回原路径。用户挂载的数据走用户自己的卷，不进快照、不受
-/// TTL 管辖；只有未挂载的部分随 overlay 持久。中转位在 /tmp（随容器销毁），
-/// 全程容器私有 mount namespace，不落宿主机。
-pub const VM_INIT_SCRIPT: &str = r#"#!/bin/sh
-# overlayfs-csi VM 模式容器入口：把白名单系统目录叠上「持久 upperdir」的
-# overlay 后 exec 原命令。写入直接落在 /.ofcsi-vm（hostPath 持久卷），
-# pod 删除重建后修改原样回来——写时持久，没有退出写回步骤。
-set -eu
-BASE=/.ofcsi-vm
-DIRS="etc usr var opt root home srv"
-KEEP=/tmp/.ofcsi-keep
-TAB=$(printf '\t')
-
-# ── 用户挂载排除 ────────────────────────────────────────────
-# 白名单目录下已存在的挂载点一律排除在 overlay 之外：先 bind 到容器私有
-# 中转位，overlay 挂好后按浅→深 bind 回原路径（mount 树上后挂的在顶层，
-# 用户的挂载完好地浮在 overlay 之上）。用户挂载 = 用户显式声明这份数据
-# 归自己的卷管，程序不接管、不遮蔽。
-rm -rf "$KEEP"
-mkdir -p "$KEEP"
-: > "$KEEP/submounts"
-for d in $DIRS; do
-  # 匹配白名单目录自身及其下所有子路径（mountPath: /var 整目录挂载也算用户
-  # 挂载，必须排除，否则 overlay 会遮蔽它）。第 1 列 = 斜杠深度；浅→深排序
-  # 保证 bind 回时父路径先就位。
-  awk -v d="/$d" '$5 == d || index($5, d "/") == 1 { n = gsub(/\//, "/", $5); print n "\t" $5 }' \
-    /proc/self/mountinfo >> "$KEEP/submounts"
-done
-sort -n -u "$KEEP/submounts" -o "$KEEP/submounts"
-: > "$KEEP/bindings"
-i=0
-while IFS="$TAB" read -r _ m; do
-  i=$((i + 1))
-  if [ -f "$m" ]; then : > "$KEEP/$i"; else mkdir -p "$KEEP/$i"; fi
-  mount --bind "$m" "$KEEP/$i"
-  printf '%s\t%s\n' "$i" "$m" >> "$KEEP/bindings"
-done < "$KEEP/submounts"
-
-# ── 上次运行写进快照的 kubelet 注入文件清理（防快照膨胀）──────
-mkdir -p "$BASE/up/etc"
-rm -f "$BASE/up/etc/hosts" "$BASE/up/etc/hostname" "$BASE/up/etc/resolv.conf"
-
-# ── bind 固定镜像目录 + 自叠加 overlay ────────────────────────
-# 先 bind（固定挂载前的镜像内容），再以 bind 路径为 lowerdir 挂回原目录：
-# 直接以 /$d 作 lowerdir 会触发 overlayfs 的路径重叠检查。
-for d in $DIRS; do
-  [ -d "/$d" ] || continue
-  mkdir -p "$BASE/bind/$d" "$BASE/up/$d" "$BASE/work/$d"
-  mount --bind "/$d" "$BASE/bind/$d"
-  mount -t overlay overlay \
-    -o "lowerdir=$BASE/bind/$d,upperdir=$BASE/up/$d,workdir=$BASE/work/$d" \
-    "/$d"
-done
-
-# ── 排除的挂载点按浅→深 bind 回原路径 ─────────────────────────
-while IFS="$TAB" read -r i m; do
-  [ -e "$m" ] || { if [ -f "$KEEP/$i" ]; then : > "$m"; else mkdir -p "$m"; fi; }
-  mount --bind "$KEEP/$i" "$m"
-done < "$KEEP/bindings"
-
-# ── 执行原命令 ──────────────────────────────────────────────
-[ "$#" -ge 1 ] || { echo "ofcsi-vm: no command to exec" >&2; exit 1; }
-exec "$@"
-"#;
+/// TTL 管辖；只有未挂载的部分随 overlay 持久。
+pub const VM_INIT_SCRIPT: &str = include_str!("vm-init.sh");
 
 /// meta.json：GC 唯一依据。webhook 注入时写 ttl_s（取自 pod 注解）；GC 循环对活跃
 /// VM 刷新 last_seen；目录失去活跃 pod 后从 last_seen 起 TTL 过期才删除。
@@ -118,22 +59,15 @@ pub struct VmMeta {
 /// 注解语义：None = 非 VM pod（放行）；Some(Err) = 注解存在但非法（拒绝创建）。
 ///
 /// 与 PVC 注解的 warn+回退刻意不同：PVC 回退只损失 TTL 精度，而这里静默放行等于
-/// 「用户以为持久了、实际没有」——数据丢失，必须 fail fast。
+/// 「用户以为持久了、实际没有」——数据丢失，必须 fail fast。解析规则共享自
+/// [`parse_max_age_s`]，只有失败处置是本域的。
 pub fn vm_ttl(pod: &Pod) -> Option<Result<i64, String>> {
     let raw = pod
         .metadata
         .annotations
         .as_ref()?
         .get(MAX_AGE_ANNOTATION)?;
-    Some(match raw.parse::<i64>() {
-        Ok(v) if v > 0 => Ok(v),
-        Ok(v) => Err(format!(
-            "annotation {MAX_AGE_ANNOTATION} must be a positive integer, got {v}"
-        )),
-        Err(e) => Err(format!(
-            "annotation {MAX_AGE_ANNOTATION} must be a positive integer, got {raw:?} ({e})"
-        )),
-    })
+    Some(parse_max_age_s(raw))
 }
 
 /// 是否已完成注入：spec.volumes 中存在我们的 hostPath 卷。
@@ -203,16 +137,22 @@ pub fn read_meta(dir: &Path) -> anyhow::Result<Option<VmMeta>> {
 }
 
 /// 只刷新 last_seen、保留 ttl_s：GC 循环对活跃 VM 调用。
+/// last_seen 只需支持「pod 删除后从冻结点起算 TTL」，30s 周期的精确刷新毫无
+/// 信息量——距上次不足 min(ttl/10, 60s) 时跳过写盘（读一次换掉一次写+脏页）。
 pub fn touch_meta(dir: &Path, now: i64) -> anyhow::Result<()> {
     if let Some(mut meta) = read_meta(dir)? {
+        if now - meta.last_seen < (meta.ttl_s / 10).min(60) {
+            return Ok(());
+        }
         meta.last_seen = now;
         write_meta(dir, &meta)?;
     }
     Ok(())
 }
 
-/// 注入前建快照目录树并写 meta。hostPath `DirectoryOrCreate` 会自建目录，这里提前建
-/// 是为了让 meta 在 pod 首次 Running 前就存在（pod 刚建即删也不至于丢 TTL 信息）。
+/// 注入前建快照目录并写 meta + wrapper 脚本。up/work/bind 子目录由 vm-init.sh
+/// 按需创建（目录布局的唯一真源在脚本），这里只保证根与 meta 存在——pod 刚建
+/// 即删也不至于丢 TTL 信息。
 pub fn ensure_vm_dir(
     store: &Store,
     namespace: &str,
@@ -220,13 +160,69 @@ pub fn ensure_vm_dir(
     ttl_s: i64,
 ) -> anyhow::Result<PathBuf> {
     let dir = store.vm_dir(namespace, pod_name);
-    for sub in ["up", "work", "bind"] {
-        std::fs::create_dir_all(dir.join(sub))?;
+    std::fs::create_dir_all(&dir)?;
+    // wrapper 随卷分发：每次注入都重写，驱动升级后新 pod 自动用上新脚本；
+    // 内容一致则跳过写盘（稳态下零写入）。
+    let script_path = dir.join(VM_INIT_FILE);
+    let needs_write = std::fs::read_to_string(&script_path)
+        .map(|existing| existing != VM_INIT_SCRIPT)
+        .unwrap_or(true);
+    if needs_write {
+        std::fs::write(&script_path, VM_INIT_SCRIPT)?;
     }
-    // wrapper 随卷分发：每次注入都重写，驱动升级后新 pod 自动用上新脚本
-    std::fs::write(dir.join("vm-init.sh"), VM_INIT_SCRIPT)?;
     write_meta(&dir, &VmMeta { ttl_s, last_seen: now_unix() })?;
     Ok(dir)
+}
+
+/// VM 域的周期 GC 与未注入兜底（由 controller 的 janitor 每 30s 调度——
+/// 本模块是 VM 域逻辑的唯一 owner，controller 只负责定时）。
+/// 活跃 pod 的目录只刷 last_seen（节流见 [`touch_meta`]）；失去活跃 pod 的
+/// 目录按 meta 的 TTL 过期删除；meta 缺失/损坏一律保守跳过（宁可少删，
+/// 不可误删用户数据）。
+pub async fn vm_gc_once(kube: &Client, store: &Store) -> anyhow::Result<()> {
+    let pods: Api<Pod> = Api::all(kube.clone());
+    let list = pods.list(&ListParams::default()).await?;
+    // 借用 list.items 的键：集合生命周期不超过 list，零分配
+    let mut active: HashSet<(&str, &str)> = HashSet::new();
+    for pod in &list.items {
+        // guard 先行：绝大多数 pod 无注解，省掉 name/ns 的取用
+        if vm_ttl(pod).is_none() {
+            continue;
+        }
+        let (Some(ns), Some(name)) = (
+            pod.metadata.namespace.as_deref(),
+            pod.metadata.name.as_deref(),
+        ) else {
+            continue;
+        };
+        if !is_vm_injected(pod) {
+            // webhook 失效期（failurePolicy: Ignore）建成的 pod 静默失去持久化——
+            // 放行等于数据丢失，删除强制重走注入（fail fast）。
+            tracing::warn!(ns, name, "VM pod was not injected (webhook down?); deleting so it is recreated with injection");
+            let api: Api<Pod> = Api::namespaced(kube.clone(), ns);
+            api.delete(name, &DeleteParams::default()).await?;
+            continue;
+        }
+        active.insert((ns, name));
+    }
+
+    let now = now_unix();
+    for (ns, name) in store.list_vm_dirs()? {
+        let dir = store.vm_dir(&ns, &name);
+        if active.contains(&(ns.as_str(), name.as_str())) {
+            touch_meta(&dir, now)?;
+            continue;
+        }
+        let Some(meta) = read_meta(&dir)? else {
+            tracing::warn!(dir = %dir.display(), "VM dir missing/corrupt meta.json; skipping this round");
+            continue;
+        };
+        if vm_expired(meta.ttl_s, meta.last_seen, now) {
+            tracing::warn!(dir = %dir.display(), "removing expired VM snapshot dir");
+            std::fs::remove_dir_all(&dir)?;
+        }
+    }
+    Ok(())
 }
 
 fn container_patches(
@@ -256,16 +252,12 @@ fn container_patches(
         }));
     }
 
-    let mounts = json!([
-        {"name": VM_VOLUME_NAME, "mountPath": VM_DIR},
-    ]);
+    let m = json!({"name": VM_VOLUME_NAME, "mountPath": VM_DIR});
     if c.volume_mounts.is_some() {
-        for m in mounts.as_array().expect("mounts is an array") {
-            patches.push(json!({"op": "add", "path": format!("{base}/volumeMounts/-"), "value": m}));
-        }
+        patches.push(json!({"op": "add", "path": format!("{base}/volumeMounts/-"), "value": m}));
     } else {
         patches.push(json!({
-            "op": "add", "path": format!("{base}/volumeMounts"), "value": mounts,
+            "op": "add", "path": format!("{base}/volumeMounts"), "value": [m],
         }));
     }
     patches
@@ -286,35 +278,55 @@ pub fn injection_patches(pod: &Pod, namespace: &str, store: &Store) -> Result<Ve
     let spec = pod.spec.as_ref().ok_or("pod has no spec")?;
 
     let snapshot_dir = store.vm_dir(namespace, &name);
-    let volumes = json!([
-        {"name": VM_VOLUME_NAME, "hostPath": {"path": snapshot_dir.display().to_string(), "type": "DirectoryOrCreate"}},
-    ]);
+    let volume = json!(
+        {"name": VM_VOLUME_NAME, "hostPath": {"path": snapshot_dir.display().to_string(), "type": "DirectoryOrCreate"}}
+    );
 
     let mut patches = Vec::new();
     if spec.volumes.is_some() {
-        for v in volumes.as_array().expect("volumes is an array") {
-            patches.push(json!({"op": "add", "path": "/spec/volumes/-", "value": v}));
-        }
+        patches.push(json!({"op": "add", "path": "/spec/volumes/-", "value": volume}));
     } else {
-        patches.push(json!({"op": "add", "path": "/spec/volumes", "value": volumes}));
+        patches.push(json!({"op": "add", "path": "/spec/volumes", "value": [volume]}));
     }
 
     for i in 0..spec.containers.len() {
         patches.extend(container_patches(spec, i));
     }
-
-    // 注入标记：watcher 兜底判定 + 用户可见的自描述（JSON Pointer 中 / 转义为 ~1）
-    let annotations_key = VM_INJECTED_ANNOTATION.replace('/', "~1");
-    match &pod.metadata.annotations {
-        Some(_) => patches.push(json!({
-            "op": "add", "path": format!("/metadata/annotations/{annotations_key}"), "value": "true",
-        })),
-        None => patches.push(json!({
-            "op": "add", "path": "/metadata/annotations",
-            "value": {VM_INJECTED_ANNOTATION: "true"},
-        })),
-    }
     Ok(patches)
+}
+
+fn deny(msg: impl Into<String>) -> Value {
+    json!({
+        "allowed": false,
+        "status": {"code": 400, "message": msg.into()},
+    })
+}
+
+/// CREATE 请求的业务处置：Ok = 注入响应字段（allowed/patch/patchType），
+/// Err = 拒绝消息（由调用方转 deny 响应）。全程早返回，无嵌套。
+fn handle_create(object: &Value, namespace: &str, store: &Store) -> Result<Value, String> {
+    let pod: Pod =
+        Pod::deserialize(object).map_err(|e| format!("admission object is not a Pod: {e}"))?;
+    let ttl = match vm_ttl(&pod) {
+        Some(Ok(ttl)) => ttl,
+        Some(Err(msg)) => return Err(msg),
+        // 外层已按注解放行；双保险：无注解的 Pod 到这里直接放行
+        None => return Ok(json!({"allowed": true})),
+    };
+    // 显式 metadata.name 等校验由 injection_patches 承载（Err → deny）
+    let patches = injection_patches(&pod, namespace, store)?;
+    // 目录/meta 在注入被 apiserver 接受前先落地：pod 若随后被拒绝（配额等），
+    // 残留目录由 GC 按 TTL 清理。
+    let name = pod.metadata.name.clone().unwrap_or_default();
+    ensure_vm_dir(store, namespace, &name, ttl)
+        .map_err(|e| format!("failed to create VM snapshot dir: {e}"))?;
+    let patch =
+        base64::engine::general_purpose::STANDARD.encode(Value::Array(patches).to_string());
+    Ok(json!({
+        "allowed": true,
+        "patch": patch,
+        "patchType": "JSONPatch",
+    }))
 }
 
 /// 处理 AdmissionReview 请求体，返回 AdmissionReview 响应体。
@@ -327,62 +339,38 @@ pub fn handle_admission(body: &[u8], store: &Store) -> anyhow::Result<Value> {
     // CREATE 阶段 object.metadata.namespace 可能缺省，apiserver 把目标 namespace 放在 request.namespace
     let namespace = req["namespace"].as_str().unwrap_or("default").to_string();
 
-    let allowed_obj = if operation != "CREATE" {
+    // 本 webhook 匹配全集群 pod CREATE：先在裸 Value 上廉价判注解，非 VM pod
+    // 直接放行——不做完整 pod 的深拷贝与 typed 反序列化。
+    let allowed_obj = if operation != "CREATE"
+        || req["object"]["metadata"]["annotations"]
+            .get(MAX_AGE_ANNOTATION)
+            .is_none()
+    {
         // 只在创建时注入；UPDATE/CONNECT/DELETE 一律放行
         json!({"allowed": true})
     } else {
-        let pod: Pod =
-            serde_json::from_value(req["object"].clone()).context("admission object is not a Pod")?;
-        match vm_ttl(&pod) {
-            None => json!({"allowed": true}),
-            Some(Err(msg)) => json!({
-                "allowed": false,
-                "status": {"code": 400, "message": msg},
-            }),
-            Some(Ok(ttl)) => {
-                let name = pod.metadata.name.clone().unwrap_or_default();
-                if name.is_empty() {
-                    json!({
-                        "allowed": false,
-                        "status": {"code": 400, "message":
-                            "VM mode requires an explicit metadata.name (snapshot dir is keyed by pod name)"},
-                    })
-                } else {
-                    match injection_patches(&pod, &namespace, store) {
-                        Ok(patches) => {
-                            // 目录/meta 在注入被 apiserver 接受前先落地：pod 若随后被
-                            // 拒绝（配额等），残留目录由 GC 按 TTL 清理。
-                            ensure_vm_dir(store, &namespace, &name, ttl)
-                                .context("failed to create VM snapshot dir")?;
-                            let patch = base64::engine::general_purpose::STANDARD
-                                .encode(Value::Array(patches).to_string());
-                            json!({
-                                "allowed": true,
-                                "patch": patch,
-                                "patchType": "JSONPatch",
-                            })
-                        }
-                        Err(msg) => json!({
-                            "allowed": false,
-                            "status": {"code": 400, "message": msg},
-                        }),
-                    }
-                }
-            }
-        }
+        handle_create(&req["object"], &namespace, store).unwrap_or_else(deny)
     };
 
-    let mut response = json!({"uid": uid});
-    if let (Value::Object(map), Value::Object(allowed)) = (&mut response, &allowed_obj) {
-        for (k, val) in allowed {
-            map.insert(k.clone(), val.clone());
+    let mut response = serde_json::Map::new();
+    response.insert("uid".to_string(), Value::String(uid));
+    if let Value::Object(fields) = allowed_obj {
+        for (k, val) in fields {
+            response.insert(k, val);
         }
     }
     Ok(json!({
         "apiVersion": v["apiVersion"].as_str().unwrap_or("admission.k8s.io/v1"),
         "kind": "AdmissionReview",
-        "response": response,
+        "response": Value::Object(response),
     }))
+}
+
+fn http(status: StatusCode, body: impl Into<Body>) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .body(body.into())
+        .expect("static response")
 }
 
 async fn mutate(
@@ -395,13 +383,11 @@ async fn mutate(
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!("webhook read body failed: {e}");
-                    return Ok(Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .body(Body::from("read body failed"))
-                        .expect("static response"));
+                    return Ok(http(StatusCode::BAD_REQUEST, "read body failed"));
                 }
             };
             match handle_admission(&body, &store) {
+                // JSON 响应必须带 content-type（apiserver 解析响应体的前提）
                 Ok(review) => Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
@@ -409,17 +395,11 @@ async fn mutate(
                     .expect("static response"),
                 Err(e) => {
                     tracing::error!("webhook admission failed: {e:#}");
-                    Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::from(format!("{e:#}")))
-                        .expect("static response")
+                    http(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
                 }
             }
         }
-        _ => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::empty())
-            .expect("static response"),
+        _ => http(StatusCode::NOT_FOUND, ""),
     };
     Ok(resp)
 }
@@ -575,10 +555,6 @@ mod tests {
         assert!(text.contains(VM_INIT));
         assert!(text.contains(r#""privileged":true"#));
         assert!(text.contains(VM_DIR));
-        assert!(
-            !text.contains("/.ofcsi-vm-bin"),
-            "旧的 bin 卷挂载点必须移除"
-        );
         let wrapped: Vec<&Value> = patches
             .iter()
             .filter(|p| p["path"].as_str() == Some("/spec/containers/0/command"))
@@ -590,8 +566,12 @@ mod tests {
             "wrapper 必须转发原命令"
         );
 
-        // 标记注解：JSON Pointer 中 / 转义为 ~1
-        assert!(text.contains("/metadata/annotations/overlayfs.csi.k8s.io~1vm-injected"));
+        // 兜底检测唯一依据是 spec.volumes（is_vm_injected）；注入产物里
+        // 不再有别的标记（历史上的 vm-injected 注解写后无人读，已删除）。
+        assert!(
+            !text.contains("vm-injected"),
+            "注入不得再产出死标记注解"
+        );
     }
 
     #[test]
@@ -712,11 +692,9 @@ mod tests {
     fn ensure_vm_dir_creates_tree() {
         let store = Store::new(std::env::temp_dir().join(format!("ofcsi-vmdir-{}", std::process::id())));
         let dir = ensure_vm_dir(&store, "ns1", "p1", 60).unwrap();
-        for sub in ["up", "work", "bind"] {
-            assert!(dir.join(sub).is_dir(), "{sub} 必须存在");
-        }
-        // wrapper 随卷分发：脚本必须落盘且可执行内容完整
-        let script = std::fs::read_to_string(dir.join("vm-init.sh")).unwrap();
+        // wrapper 随卷分发：脚本必须落盘且内容完整；up/work/bind 由脚本按需
+        // 创建（布局唯一真源在 vm-init.sh），这里只保证根、脚本、meta。
+        let script = std::fs::read_to_string(dir.join(VM_INIT_FILE)).unwrap();
         assert!(script.starts_with("#!/bin/sh"), "脚本必须有 shebang");
         assert!(script.contains("mount -t overlay"), "脚本必须包含 overlay 挂载");
         assert_eq!(
@@ -726,17 +704,16 @@ mod tests {
         std::fs::remove_dir_all(&store.root).ok();
     }
 
-    /// 非 root 环境自动 skip（集成测试需要真实 mount），与 base::tests 同款。
-    fn require_root() -> bool {
-        let ok = std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .map(|o| o.stdout == b"0\n")
-            .unwrap_or(false);
-        if !ok {
-            eprintln!("skipping: requires root");
-        }
-        ok
+    use crate::base::require_root;
+
+    /// root 集成测试共用的 shell 执行助手（失败即 panic，带 stderr）。
+    fn sh_in(dir: &Path, cmd: &str) {
+        let out = duct::cmd!("sh", "-c", cmd).dir(dir).run().expect("sh failed");
+        assert!(
+            out.status.success(),
+            "{cmd} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// 复刻 vm-init.sh 的关键序列（bind 固定 lower → 自叠加 overlay），在真内核上
@@ -757,32 +734,13 @@ mod tests {
         std::fs::write(dir.join("lower/b.txt"), "orig-b").unwrap();
 
         let mount = || {
-            let out = duct::cmd!(
-                "sh",
-                "-c",
+            sh_in(
+                &dir,
                 "mount --bind lower bind && \
-                 mount -t overlay overlay -o lowerdir=bind,upperdir=up,workdir=work mnt"
-            )
-            .dir(&dir)
-            .run()
-            .expect("mount failed");
-            assert!(
-                out.status.success(),
-                "mount failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+                 mount -t overlay overlay -o lowerdir=bind,upperdir=up,workdir=work mnt",
             );
         };
-        let umount = || {
-            let out = duct::cmd!("sh", "-c", "umount mnt && umount bind")
-                .dir(&dir)
-                .run()
-                .expect("umount failed");
-            assert!(
-                out.status.success(),
-                "umount failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
+        let umount = || sh_in(&dir, "umount mnt && umount bind");
 
         // 第一次「pod 启动」：修改（新增/删除/覆写）写穿透进 up/
         mount();
@@ -827,20 +785,15 @@ mod tests {
         std::fs::write(dir.join("lower/usr/app.txt"), "image").unwrap();
         std::fs::write(dir.join("real-data/hostfile"), "user-data").unwrap();
 
-        let sh = |cmd: &str| {
-            let out = duct::cmd!("sh", "-c", cmd).dir(&dir).run().expect("sh failed");
-            assert!(out.status.success(), "{cmd} failed: {}", String::from_utf8_lossy(&out.stderr));
-        };
-
         let stack = || {
             // 模拟 kubelet 挂用户卷到白名单目录下，随后三阶段：排除 → overlay → bind 回
-            sh("mount --bind real-data mnt/usr/keepme");
-            sh("mount --bind mnt/usr/keepme tmp-keep");
-            sh("mount --bind lower bind && mount -t overlay overlay -o lowerdir=bind,upperdir=up,workdir=work mnt/usr");
-            sh("mount --bind tmp-keep mnt/usr/keepme");
+            sh_in(&dir, "mount --bind real-data mnt/usr/keepme");
+            sh_in(&dir, "mount --bind mnt/usr/keepme tmp-keep");
+            sh_in(&dir, "mount --bind lower bind && mount -t overlay overlay -o lowerdir=bind,upperdir=up,workdir=work mnt/usr");
+            sh_in(&dir, "mount --bind tmp-keep mnt/usr/keepme");
         };
         let unstack = || {
-            sh("umount mnt/usr/keepme && umount mnt/usr && umount bind && umount mnt/usr/keepme");
+            sh_in(&dir, "umount mnt/usr/keepme && umount mnt/usr && umount bind && umount mnt/usr/keepme");
         };
 
         // 第一次「pod 启动」
@@ -886,16 +839,11 @@ mod tests {
         std::fs::write(dir.join("lower/usr/app.txt"), "image").unwrap();
         std::fs::write(dir.join("real-data/userfile"), "user-data").unwrap();
 
-        let sh = |cmd: &str| {
-            let out = duct::cmd!("sh", "-c", cmd).dir(&dir).run().expect("sh failed");
-            assert!(out.status.success(), "{cmd} failed: {}", String::from_utf8_lossy(&out.stderr));
-        };
-
         // kubelet 把用户卷挂到白名单目录自身（mnt/usr），随后三阶段排除
-        sh("mount --bind real-data mnt/usr");
-        sh("mount --bind mnt/usr tmp-keep");
-        sh("mount --bind lower bind && mount -t overlay overlay -o lowerdir=bind,upperdir=up,workdir=work mnt/usr");
-        sh("mount --bind tmp-keep mnt/usr");
+        sh_in(&dir, "mount --bind real-data mnt/usr");
+        sh_in(&dir, "mount --bind mnt/usr tmp-keep");
+        sh_in(&dir, "mount --bind lower bind && mount -t overlay overlay -o lowerdir=bind,upperdir=up,workdir=work mnt/usr");
+        sh_in(&dir, "mount --bind tmp-keep mnt/usr");
 
         // 访问 /usr 看到的是用户卷；写入直达用户卷，不进快照
         assert_eq!(std::fs::read_to_string(dir.join("mnt/usr/userfile")).unwrap(), "user-data");
@@ -906,7 +854,7 @@ mod tests {
             "整目录挂载时 overlay 不得捕获任何写入"
         );
 
-        sh("umount mnt/usr && umount mnt/usr && umount bind && umount mnt/usr");
+        sh_in(&dir, "umount mnt/usr && umount mnt/usr && umount bind && umount mnt/usr");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
