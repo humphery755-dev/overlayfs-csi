@@ -2,17 +2,67 @@
 
 English | [简体中文](README.zh-CN.md)
 
-This implements a Kubernetes [Container Storage Interface](https://github.com/container-storage-interface/spec/blob/master/spec.md) that provides persistent volumes as [overlay mounts](https://en.wikipedia.org/wiki/OverlayFS) on top of shared _base_ volumes. Only new and modified files are written to a volume's own data directory; everything it has in common with a base is shared read-only.
+A Kubernetes [CSI](https://github.com/container-storage-interface/spec/blob/master/spec.md) driver with two core capabilities:
 
-This can be particularly useful in build pipelines, as it allows benefiting from incremental compilation (whenever supported) without having to copy all files for each run.
+1. **One annotation turns a pod into a tiny VM.** Anything installed or changed inside the container — `apt install`, edited configs, the whole system tree — is persisted with write-through semantics and survives pod deletion and recreation. No PVC required.
+2. **Persistent volumes as overlayfs increments.** Volumes store only new and modified files on top of shared read-only _base_ trees, so clone-like environments (build pipelines, preinstalled toolchains) cost almost nothing.
 
-This is similar to using `dataSource` in CSIs that support efficient [volume cloning](https://kubernetes.io/docs/concepts/storage/volume-pvc-datasource/), except that maintaining base volumes is handled by the CSI automatically.
+Both are driven by the same annotation name, `overlayfs.csi.k8s.io/max-age-s`: on a **pod** it enables VM mode; on a **PVC** it overrides the promoted-base TTL.
+
+| Feature | What you write | What you get |
+|---|---|---|
+| **VM mode** | one pod annotation | system-level changes persist across pod recreation — write-through, no save-on-exit step |
+| **Persistent volumes** | a plain [PVC](https://kubernetes.io/docs/concepts/storage/persistent-volumes/) | data survives pod deletion; only increments hit disk |
+| **Base sharing** | `touch <volume-root>/.as_base` | the environment is frozen into a shared read-only base for subsequent PVCs |
+| **TTL annotation** | the same annotation, two levels | pod → snapshot retention; PVC → promoted-base TTL |
 
 This repository also provides an example for building Kubernetes CSIs in Rust.
 
-## Usage
+## VM mode: a pod that behaves like a VM
 
-- Volumes are requested as standalone [PVCs](https://kubernetes.io/docs/concepts/storage/persistent-volumes/) using this driver's StorageClass, and mounted through a `persistentVolumeClaim` reference (see [`examples/pod.yaml`](examples/pod.yaml) for a complete example):
+Annotate a pod with `overlayfs.csi.k8s.io/max-age-s: "<seconds>"`:
+
+```yaml
+metadata:
+  name: vm-demo
+  annotations:
+    overlayfs.csi.k8s.io/max-age-s: "7776000"   # keep the snapshot for 90 days after deletion
+spec:
+  containers:
+    - name: vm-demo
+      image: debian:bullseye-slim
+      command: ["sleep", "infinity"]   # an explicit command is required
+```
+
+Then use it like a machine:
+
+```
+$ kubectl apply -f examples/dev-pod.yaml   # create (the webhook injects everything)
+$ kubectl exec -it vm-demo -- bash         # apt install, edit /etc, compile — anything
+$ kubectl delete pod vm-demo               # deletion is instant: nothing is "snapshotted"
+$ kubectl apply -f examples/dev-pod.yaml   # recreate whenever: everything is still there
+```
+
+How it works — a mutating webhook (deployed by the chart) rewrites annotated pods at creation time:
+
+- Each system directory (`/etc`, `/usr`, `/var`, `/opt`, `/root`, `/home`, `/srv`) is layered with an overlay whose `upperdir` lives in a hostPath snapshot dir (`<storageRoot>/vm/<namespace>/<pod-name>`); the image content is pinned as the lower layer via a bind mount. Every write goes straight to disk in the snapshot dir — **there is no save-on-exit step**, so SIGKILL/OOM/power loss cannot lose confirmed writes, and pod deletion triggers no data movement at all.
+- On recreation the same upperdirs are mounted again: your changes are back. Deleted files stay deleted (whiteouts persist). Recreating with a newer image keeps your changes layered on top of the new content.
+- The annotation value doubles as the retention TTL: after the pod is gone, the controller's GC removes the snapshot dir once this many seconds have passed. Until then, recreating the pod costs nothing but the apply itself.
+- The webhook also injects `privileged: true` (mounting requires it) and wraps each container's command with a small init script that performs the mounts and then re-execs your command.
+
+Hard rules (fail-fast by design — silent non-persistence would mean silent data loss):
+
+- An invalid annotation value, a missing `command`, or `runAsNonRoot`/non-root-uid pods are **refused at creation** with an explanatory message.
+- If the webhook is briefly unavailable (its `failurePolicy` is `Ignore`, so ordinary pods are never blocked), the controller detects VM pods that were created without injection and deletes them so they are recreated with injection.
+- Unusual mount points inside the system directories (they would be shadowed) make the init script fail the container at startup instead of hiding them.
+
+Known limits: only plain containers are persisted (not initContainers/sidecars); the image must contain a POSIX `sh`; `/tmp` and `/run` are not persisted while `machine-id` and ssh host keys are (VM semantics); snapshots are node-local, so multi-node clusters need the pod to be rescheduled onto the same node. Two inherited overlayfs behaviours to be aware of: `rename` of a directory across layers returns `EXDEV` (well-behaved tools like `mv` and `git` fall back to copy+delete; very large directories take one extra copy); and the *first* write to an existing file from the image triggers a full copy-up of that file (subsequent writes have no extra cost).
+
+A ready-made template for per-developer environments lives in [`examples/dev-pod.yaml`](examples/dev-pod.yaml) (change name/image/command and go).
+
+## Persistent volumes as overlayfs increments
+
+- Volumes are requested as standalone PVCs using this driver's StorageClass, and mounted through a `persistentVolumeClaim` reference (see [`examples/pod.yaml`](examples/pod.yaml) for a complete example):
 
   ```yaml
   apiVersion: v1
@@ -39,37 +89,6 @@ This repository also provides an example for building Kubernetes CSIs in Rust.
 
 > [!WARNING]
 > Do not use generic ephemeral volumes (`volume.csi` with a `volumeClaimTemplate` in the pod spec) with this driver for anything you want to keep. Such volumes are backed by a PVC that is deleted together with the pod, so their data is destroyed on pod deletion — they do not satisfy persistence needs. Use a standalone PVC as above.
-
-## VM mode: pod-wide persistence via a single annotation
-
-Annotate a pod with `overlayfs.csi.k8s.io/max-age-s: "<seconds>"` and it behaves like a small VM: anything you change inside the container — `apt install`, edited configs — persists across pod deletion and recreation, for the whole system tree (`/etc`, `/usr`, `/var`, `/opt`, `/root`, `/home`, `/srv`). No PVC required:
-
-```yaml
-metadata:
-  name: vm-demo
-  annotations:
-    overlayfs.csi.k8s.io/max-age-s: "7776000"   # keep the snapshot for 90 days after deletion
-spec:
-  containers:
-    - name: vm-demo
-      image: debian:bullseye-slim
-      command: ["sleep", "infinity"]   # an explicit command is required
-```
-
-A mutating webhook (deployed by the chart) rewrites annotated pods at creation time:
-
-- Each system directory above is layered with an overlay whose `upperdir` lives in a hostPath snapshot dir (`<storageRoot>/vm/<namespace>/<pod-name>`); the image content is pinned as the lower layer via a bind mount. Every write goes straight to disk in the snapshot dir — **there is no save-on-exit step**, so SIGKILL/OOM/power loss cannot lose confirmed writes.
-- On recreation the same upperdirs are mounted again: your changes are back. Deleted files stay deleted (whiteouts persist). Recreating with a newer image keeps your changes layered on top of the new content.
-- The annotation value doubles as the retention TTL: after the pod is gone, the controller's GC removes the snapshot dir once this many seconds have passed.
-- The webhook also injects `privileged: true` (mounting requires it) and wraps each container's command with a small init script that performs the mounts and then re-execs your command.
-
-Hard rules (fail-fast by design — silent non-persistence would mean silent data loss):
-
-- An invalid annotation value, a missing `command`, or `runAsNonRoot`/non-root-uid pods are **refused at creation** with an explanatory message.
-- If the webhook is briefly unavailable (its `failurePolicy` is `Ignore`, so ordinary pods are never blocked), the controller detects VM pods that were created without injection and deletes them so they are recreated with injection.
-- Unusual mount points inside the system directories (they would be shadowed) make the init script fail the container at startup instead of hiding them.
-
-Known limits: only plain containers are persisted (not initContainers/sidecars); the image must contain a POSIX `sh`; `/tmp` and `/run` are not persisted while `machine-id` and ssh host keys are (VM semantics); snapshots are node-local, so multi-node clusters need the pod to be rescheduled onto the same node. Two inherited overlayfs behaviours to be aware of: `rename` of a directory across layers returns `EXDEV` (well-behaved tools like `mv` and `git` fall back to copy+delete; very large directories take one extra copy); and the *first* write to an existing file from the image triggers a full copy-up of that file (subsequent writes have no extra cost).
 
 ### Bases and `.as_base`
 
@@ -117,42 +136,46 @@ It would be fairly easy to support arbitrary volume types. For CSIs that support
    $ export PROTOC=$PWD/docker/protoc-usr/bin/protoc PROTOC_INCLUDE=$PWD/docker/protoc-usr/include
    ```
 
-2. Customize values in the [Helm chart](https://helm.sh/) (`chart/values.yaml`): `namespace`, `image`, driver `name`, `storageClassName` (defaults to the driver name), `storageRoot`, `maxAgeSeconds` (per-volume overridable, see above).
+2. Customize values in the [Helm chart](https://helm.sh/) (`chart/values.yaml`): `namespace`, `image`, driver `name`, `storageClassName` (defaults to the driver name), `storageRoot`, `maxAgeSeconds` (per-volume overridable, see above), and `webhook` (enabled by default — set `webhook.enabled: false` to opt out of VM mode).
 3. Apply the chart
    ```
    $ helm install overlayfs-csi chart
    ```
 
-To test the deployment, apply [`examples/pod.yaml`](examples/pod.yaml), which creates a PVC and a pod mounting it at `/test` (both in the `kube-system` namespace, matching the chart default):
+### Trying it out
 
-1. Apply the example (the namespace already exists in most clusters; adjust it in `examples/pod.yaml` if yours differs)
-   ```
-   $ kubectl apply -f examples/pod.yaml
-   ```
-2. Write some data and mark the volume as base material
-   ```
-   $ kubectl exec test -- touch /test/hello
-   $ kubectl exec test -- touch /test/.as_base
-   ```
-3. Delete the pod, then apply `examples/pod.yaml` again: the pod remounts the same PVC and the data is still there.
-   ```
-   $ kubectl exec test -- ls /test
-   hello
-   $ kubectl exec test -- touch /test/hi
-   ```
-   Writes go to the volume's own data directory only. A base — if one exists — is never modified, and no untouched file is copied.
-4. Once the pod from step 2 was deleted, its `.as_base` marker caused the volume to be frozen into a new base on unstage (assuming no valid base existed). A _new_ PVC created afterwards starts as an overlay on top of it and therefore already contains `hello`.
+**VM mode** — apply [`examples/dev-pod.yaml`](examples/dev-pod.yaml), install something, delete, recreate:
+
+```
+$ kubectl apply -f examples/dev-pod.yaml && kubectl -n default wait --for=condition=Ready pod/dev-cpp-01
+$ kubectl exec dev-cpp-01 -- bash -c 'echo demo > /etc/hello && apt-get update -qq && apt-get install -y -qq figlet'
+$ kubectl delete pod dev-cpp-01 && kubectl apply -f examples/dev-pod.yaml
+$ kubectl exec dev-cpp-01 -- ls /etc/hello      # still there
+$ kubectl exec dev-cpp-01 -- which figlet       # still installed
+```
+
+**PVC volumes** — apply [`examples/pod.yaml`](examples/pod.yaml), which creates a PVC and a pod mounting it at `/test`:
+
+```
+$ kubectl apply -f examples/pod.yaml
+$ kubectl exec test -- touch /test/hello /test/.as_base
+$ kubectl delete pod test && kubectl apply -f examples/pod.yaml   # data is still there
+$ kubectl exec test -- ls /test
+hello
+```
+
+Once the pod from step 2 was deleted, its `.as_base` marker caused the volume to be frozen into a new base on unstage (assuming no valid base existed). A _new_ PVC created afterwards starts as an overlay on top of it and therefore already contains `hello`.
 
 ### Shutting down for a long time (days to months)
 
-The same example survives arbitrarily long downtime — only the pod is deleted, the PVC (and with it the data directory on the node) stays:
+The same examples survive arbitrarily long downtime — only the pod is deleted, the PVC (and with it the data directory on the node) or the VM snapshot dir stays:
 
 ```
 $ kubectl delete pod test        # pod only — never `kubectl delete -f examples/pod.yaml`, that would delete the PVC too
 $ kubectl apply -f examples/pod.yaml      # days later: same PVC reused, all changes are still there
 ```
 
-`maxAgeSeconds` controls how long the _full_ environment (base + your changes) re-attaches after downtime; PVC data itself does not depend on it. Set it larger than your expected downtime interval (see [`chart/values.yaml`](chart/values.yaml)).
+For PVC volumes, `maxAgeSeconds` controls how long the _full_ environment (base + your changes) re-attaches after downtime; PVC data itself does not depend on it. For VM pods, the annotation value *is* the snapshot retention. Set both larger than your expected downtime interval (see [`chart/values.yaml`](chart/values.yaml)).
 
 ## Implementation details
 
