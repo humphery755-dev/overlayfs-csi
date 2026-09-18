@@ -7,6 +7,12 @@
 # 禁止：kubectl delete -f pod.yaml —— 会连 PVC 一起删除，
 #       PV 随之回收，数据目录被 GC 清理，数据不可恢复。
 #
+# ── base 固化（进阶，供后续 PVC 共享环境）───────────────────
+# exec 进容器在卷根写 .as_base 标记（如 touch /test/.as_base），该卷最后一次
+# unstage 时会把「base+增量」合并固化成新 base；之后新建的 PVC 自动以它为
+# 只读起点（增量编译、预装环境等场景免重复搭建）。已有有效 base 时跳过。
+# base 过期时间 = 全局 maxAgeSeconds，可被下方 PVC 注解逐卷覆盖。
+#
 # ── 节点选择 ───────────────────────────────────────────────
 # StorageClass 为 WaitForFirstConsumer：Pod 被调度后，调度器把选中节点写进
 # volume.kubernetes.io/selected-node 注解，该节点的驱动实例供给卷并把 PV 的
@@ -19,7 +25,11 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: demo
-  namespace: kube-system
+  # 可选：PVC 注解逐卷覆盖全局 base TTL（秒）。注意只在首次 provision 时经
+  # PV volume_attributes 生效——本 PVC 已供给过，再加注解不影响已固化的 base；
+  # 需要生效请在删除 PVC 重建（数据随之清空）前打上。
+  # annotations:
+  #   overlayfs.csi.k8s.io/max-age-s: "7776000"
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: overlayfs.csi.k8s.io
@@ -31,7 +41,6 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: test
-  namespace: kube-system
 spec:
   terminationGracePeriodSeconds: 1
   containers:
@@ -59,7 +68,6 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: vm-demo
-  namespace: kube-system
   annotations:
     overlayfs.csi.k8s.io/max-age-s: "7776000"
 spec:

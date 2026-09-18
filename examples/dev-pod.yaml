@@ -1,0 +1,46 @@
+# 开发环境 pod 模板（VM 模式）：每人复制一份，改三处即可
+#   1. metadata.name  —— 全集群唯一（如 dev-cpp-01），快照按 <namespace>/<name> 键控
+#   2. image          —— 各语言基础镜像
+#   3. command        —— 显式指定（webhook 的 wrapper 需要转发原命令）
+# resources/ports 等字段自行添加，webhook 注入不影响它们。
+#
+# 使用流程：
+#   kubectl apply -f examples/dev-pod.yaml     # 首次创建（webhook 自动注入，无需 PVC）
+#   kubectl exec -it dev-cpp-01 -- bash        # 进去随便装：apt/pip/npm/手工编译，任意写系统目录
+#   kubectl delete pod dev-cpp-01              # 删除（快照原地保留 max-age-s 秒）
+#   kubectl apply -f examples/dev-pod.yaml     # 重建：装好的环境原样回来
+#
+# 团队约定与注意：
+#   - 代码仓库/依赖缓存建议挂独立 PVC 到白名单之外的顶层路径（如 /workspace）。
+#     挂进 /root /home /usr 等系统目录会被 vm-init.sh 的防遮蔽检测拒绝启动。
+#   - pid 1 就是 command，没有 systemd；进程管理用 tmux / supervisord。
+#   - 内核属于宿主机：升级内核包不改变 pod 内核；apt dist-upgrade 等用户态升级全部持久。
+#   - 节点磁盘是快照唯一副本（单节点架构）；重要环境请定期备份
+#     /var/lib/overlayfs-csi/vm/（管理员可配 cron rsync 到外部存储）。
+#   - 20 人同节点：务必声明 resources，防止互相挤占；同时在线人数受节点内存约束。
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dev-cpp-01
+  annotations:
+    overlayfs.csi.k8s.io/max-age-s: "7776000"   # 删除后快照保留 90 天
+spec:
+  terminationGracePeriodSeconds: 10
+  containers:
+    - name: dev
+      image: ubuntu:22.04
+      command: ["sleep", "infinity"]
+      # resources:                          # 20 人同节点时建议声明
+      #   requests: {cpu: "1", memory: 2Gi}
+      #   limits: {cpu: "4", memory: 8Gi}
+      # ports:                               # 前端 dev server 等需要对外访问时声明
+      #   - containerPort: 5173
+# ---
+# 代码与依赖缓存与环境分离（可选）：再挂一个 PVC 到 /workspace，
+# 让「环境」随快照、「代码」随 PVC，各自独立演进：
+#   volumeMounts:
+#     - {name: work, mountPath: /workspace}
+# volumes:
+#   - name: work
+#     persistentVolumeClaim:
+#       claimName: dev-cpp-01-work
