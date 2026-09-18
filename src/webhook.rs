@@ -377,15 +377,18 @@ fn tls_acceptor(cert: &Path, key: &Path) -> anyhow::Result<tokio_rustls::TlsAcce
         std::io::BufReader::new(std::fs::File::open(key).with_context(|| {
             format!("open webhook key {}", key.display())
         })?);
-    // PKCS8 优先（helm genSelfSignedCert 输出），失败回退 RSA/PKCS1
-    let key_der = rustls_pemfile::pkcs8_private_keys(&mut key_file)
-        .or_else(|_| {
+    // 先 PKCS1（helm genSelfSignedCert 输出 "RSA PRIVATE KEY"），空/异型再试
+    // PKCS8——注意 rustls-pemfile 1.x 对不认识的块返回 Ok(空) 而非 Err，必须以
+    // 「结果非空」为判据回退，不能依赖 or_else 捕获 Err。
+    let key_der = rustls_pemfile::rsa_private_keys(&mut key_file)
+        .ok()
+        .filter(|keys| !keys.is_empty())
+        .or_else(|| {
             use std::io::Seek;
-            key_file.seek(std::io::SeekFrom::Start(0))?;
-            rustls_pemfile::rsa_private_keys(&mut key_file)
-        })?
-        .into_iter()
-        .next()
+            key_file.seek(std::io::SeekFrom::Start(0)).ok()?;
+            rustls_pemfile::pkcs8_private_keys(&mut key_file).ok()
+        })
+        .and_then(|keys| keys.into_iter().next())
         .context("webhook key file contains no private key")?;
     let config = tokio_rustls::rustls::ServerConfig::builder()
         .with_safe_defaults()
