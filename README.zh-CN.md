@@ -121,10 +121,14 @@ $ kubectl apply -f examples/dev-pod.yaml   # 任意久后重建：一切原样�
 1. 编译二进制并构建 docker 镜像：
 
    ```
-   $ cd docker
-   $ cross build -r --target-dir ../target-cross
-   $ cp ../target-cross/release/overlayfs-csi .
-   $ docker build -t overlayfs-csi .
+   cd docker
+   cross build -r --target-dir ../target-cross
+   cp ../target-cross/release/overlayfs-csi .
+   docker build -t overlayfs-csi .
+
+   # for k3s -- apt install buildkit
+   alias kctl='sudo nerdctl -a /run/k3s/containerd/containerd.sock -n k8s.io'
+   kctl build -t overlayfs-csi .
    ```
 
    构建会下载 `csi.proto` 并需要 protobuf 编译器。使用 `cross` 时，[`Cross.toml`](Cross.toml) 指向 [`docker/Dockerfile.cross`](docker/Dockerfile.cross)——预装 protoc 25.1 的构建镜像（离线友好：先把 protoc 压缩包内容放到 `docker/protoc-usr/` 下）。直接在宿主机 `cargo build` 的话，自行指定 protoc：

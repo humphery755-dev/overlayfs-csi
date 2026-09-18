@@ -122,10 +122,14 @@ It would be fairly easy to support arbitrary volume types. For CSIs that support
 1. Compile the binary and build the docker image:
 
    ```
-   $ cd docker
-   $ cross build -r --target-dir ../target-cross
-   $ cp ../target-cross/release/overlayfs-csi .
-   $ docker build -t overlayfs-csi .
+   cd docker
+   cross build -r --target-dir ../target-cross
+   cp ../target-cross/release/overlayfs-csi .
+   docker build -t overlayfs-csi .
+
+   # for k3s -- apt install buildkit
+   alias kctl='sudo nerdctl -a /run/k3s/containerd/containerd.sock -n k8s.io'
+   kctl build -t overlayfs-csi .
    ```
 
    The build downloads `csi.proto` and needs a protobuf compiler. With `cross`, [`Cross.toml`](Cross.toml) points at [`docker/Dockerfile.cross`](docker/Dockerfile.cross), a builder image with protoc 25.1 preinstalled (useful offline: place the protoc tarball contents under `docker/protoc-usr/` first). For a plain `cargo build` on the host, point the toolchain at a protoc yourself:
