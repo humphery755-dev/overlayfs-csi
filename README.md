@@ -69,7 +69,7 @@ Hard rules (fail-fast by design — silent non-persistence would mean silent dat
 - If the webhook is briefly unavailable (its `failurePolicy` is `Ignore`, so ordinary pods are never blocked), the controller detects VM pods that were created without injection and deletes them so they are recreated with injection.
 - Unusual mount points inside the system directories (they would be shadowed) make the init script fail the container at startup instead of hiding them.
 
-Known limits: only plain containers are persisted (not initContainers/sidecars); the image must contain a POSIX `sh`; `/tmp` and `/run` are not persisted while `machine-id` and ssh host keys are (VM semantics); snapshots are node-local, so multi-node clusters need the pod to be rescheduled onto the same node.
+Known limits: only plain containers are persisted (not initContainers/sidecars); the image must contain a POSIX `sh`; `/tmp` and `/run` are not persisted while `machine-id` and ssh host keys are (VM semantics); snapshots are node-local, so multi-node clusters need the pod to be rescheduled onto the same node. Two inherited overlayfs behaviours to be aware of: `rename` of a directory across layers returns `EXDEV` (well-behaved tools like `mv` and `git` fall back to copy+delete; very large directories take one extra copy); and the *first* write to an existing file from the image triggers a full copy-up of that file (subsequent writes have no extra cost).
 
 ### Bases and `.as_base`
 
@@ -90,6 +90,8 @@ Known limits: only plain containers are persisted (not initContainers/sidecars);
 ### Underlying storage
 
 Only node-local storage is supported: bases and per-PVC data directories live under a hostPath storage root (`storageRoot` Helm value, `/var/lib/overlayfs-csi` by default), which in particular allows quickly converting volumes to bases. Each node maintains its own bases, and a PVC's data lives on the node it was provisioned on (see above). Bases are ordinary directories under this path, so driver pod restarts and redeployments do not lose them.
+
+The filesystem holding the storage root must support overlayfs `upperdir`: **ext4, or XFS with `ftype=1`** (check with `xfs_info | grep ftype`). NFS/CIFS/vfat are not supported — writes into overlay upper layers (per-PVC data, VM-mode snapshots) would fail or silently misbehave there.
 
 It would be fairly easy to support arbitrary volume types. For CSIs that support efficient [volume cloning](https://kubernetes.io/docs/concepts/storage/volume-pvc-datasource/), these could be used instead of the overlays.
 
@@ -177,3 +179,4 @@ $ kubectl apply -f pod.yaml      # days later: same PVC reused, all changes are 
 - Support other underlying storages (see above).
 - Allow different categories of bases with labels.
 - VM mode across nodes: record which node holds a pod's snapshot (e.g. node annotations) and pin recreated pods there, instead of relying on single-node scheduling.
+- VM mode, long term: the industry is moving image-layer management behind pluggable containerd snapshotters (Docker 29+ defaults, Nydus/OverlayBD, …). A custom snapshotter mounting the container rootfs directly on a persistent layer would make the whole rootfs durable without the per-directory overlay — a heavyweight path this project deliberately avoids for now. Notably, VM mode does not depend on the runtime's overlayfs at all: its lower layer is any bind-mounted directory view, so snapshotter swaps do not affect it.

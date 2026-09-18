@@ -69,7 +69,7 @@ chart 部署的 mutating webhook 在 Pod 创建时改写带注解的 Pod：
 - webhook 短暂不可用时（其 `failurePolicy` 为 `Ignore`，普通 Pod 永不受阻），controller 检测到「带注解但未注入」的 VM Pod 会将其删除，重建时即完成注入。
 - 系统目录内出现会被遮蔽的异常挂载点时，init 脚本直接让容器启动失败，绝不静默隐藏。
 
-已知限制：仅普通容器被持久化（initContainer/sidecar 不含）；镜像须含 POSIX `sh`；`/tmp`、`/run` 不持久而 `machine-id`、ssh host keys 持久（VM 语义）；快照在节点本地盘上，多节点集群需要 Pod 重新调度回同一节点。
+已知限制：仅普通容器被持久化（initContainer/sidecar 不含）；镜像须含 POSIX `sh`；`/tmp`、`/run` 不持久而 `machine-id`、ssh host keys 持久（VM 语义）；快照在节点本地盘上，多节点集群需要 Pod 重新调度回同一节点。另有两点 overlayfs 固有行为需要了解：跨层目录 `rename` 会返回 `EXDEV`（`mv`、`git` 等规范工具会退化为「拷贝+删除」；特别大的目录会多一次拷贝）；对镜像内已有文件的_首次_写入会触发该文件的完整 copy-up（之后写入无额外开销）。
 
 ### Base 与 `.as_base`
 
@@ -90,6 +90,8 @@ chart 部署的 mutating webhook 在 Pod 创建时改写带注解的 Pod：
 ### 底层存储
 
 仅支持节点本地存储：base 与每个 PVC 的数据目录都位于 hostPath 存储根（Helm 值 `storageRoot`，默认 `/var/lib/overlayfs-csi`）之下——这也让「卷转 base」可以快速完成。每个节点维护自己的 base，PVC 的数据固定在其供给时所在的节点（见上文）。base 就是该路径下的普通目录，因此驱动 Pod 的重启与重新部署不会丢失它们。
+
+存储根所在文件系统必须支持 overlayfs `upperdir`：**ext4，或启用了 `ftype=1` 的 XFS**（用 `xfs_info | grep ftype` 检查）。NFS/CIFS/vfat 不受支持——对 overlay 上层的写入（每 PVC 数据目录、VM 模式快照）在这些文件系统上会失败或行为异常。
 
 支持任意卷类型并不困难：对支持高效[卷克隆](https://kubernetes.io/docs/concepts/storage/volume-pvc-datasource/)的 CSI，可以用克隆替代 overlay。
 
@@ -177,3 +179,4 @@ $ kubectl apply -f pod.yaml      # 数天后：同名 PVC 复用，所有变更�
 - 支持其他底层存储（见上文）。
 - 通过标签区分不同类别的 base。
 - VM 模式跨节点：记录 Pod 快照所在的节点（如节点注解）并把重建的 Pod 钉回该节点，取代目前的单节点调度假设。
+- VM 模式（远期）：行业正把镜像层管理推进到可插拔 containerd 快照器之后（Docker 29+ 默认化、Nydus/OverlayBD 等）。自定义快照器把容器 rootfs 直接落在持久层，可免除按目录叠加 overlay 实现整 rootfs 持久——重量级路线，本项目现阶段刻意不做。值得一提的是，VM 模式完全不依赖运行时的 overlayfs：其 lower 层是任意 bind 出来的目录视图，快照器换血不影响它。

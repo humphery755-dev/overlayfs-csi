@@ -103,6 +103,12 @@ PVC 的 max-age-s 非法时回退全局 TTL 只损失 TTL 精度；VM 模式下�
 4. `/tmp`、`/run` 不持久（运行时垃圾，重启干净更健康）。
 5. `machine-id`、ssh host keys 持久（VM 语义：跨重建稳定）。
 6. 快照体积 ≈ 白名单目录变更集 + 镜像对应目录结构，占用与镜像同量级。
+7. 存储根所在文件系统必须支持 overlayfs upperdir：ext4 或 XFS(ftype=1)，不支持 NFS/CIFS/vfat。
+8. overlayfs 固有行为：跨层目录 rename 返回 EXDEV（规范工具退化为拷贝+删除）；对镜像内已有文件的首次写触发完整 copy-up，之后零开销。e2e（apt/dpkg）未见影响。
+
+## 远期方向（行业佐证，现阶段不做）
+
+行业正把镜像层管理推进到可插拔 containerd 快照器（Docker 29+ 默认化、Nydus/OverlayBD 等）。自定义快照器把容器 rootfs 直接落在持久层可免除按目录叠加，实现整 rootfs 持久——重量级路线。注意：本方案的 lower 层是 bind 出来的任意目录视图，**不依赖运行时的 overlayfs 实现**，快照器演进不影响其正确性。
 
 ## 测试
 
