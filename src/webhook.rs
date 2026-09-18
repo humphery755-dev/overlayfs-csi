@@ -38,6 +38,13 @@ pub const META_FILE: &str = "meta.json";
 
 /// vm-init.sh 全文：随快照卷分发（[`ensure_vm_dir`] 落盘），每次注入都重写——
 /// 驱动升级后新注入的 pod 自动用上新脚本。
+///
+/// 用户挂载语义（与普通 pod 一致）：白名单目录下已存在的挂载点（用户的
+/// hostPath/PVC/emptyDir，以及 kubelet 注入的 hosts/hostname/resolv.conf）
+/// 一律「排除」在 overlay 之外——bind 到容器私有中转位，overlay 挂好后按
+/// 浅→深 bind 回原路径。用户挂载的数据走用户自己的卷，不进快照、不受
+/// TTL 管辖；只有未挂载的部分随 overlay 持久。中转位在 /tmp（随容器销毁），
+/// 全程容器私有 mount namespace，不落宿主机。
 pub const VM_INIT_SCRIPT: &str = r#"#!/bin/sh
 # overlayfs-csi VM 模式容器入口：把白名单系统目录叠上「持久 upperdir」的
 # overlay 后 exec 原命令。写入直接落在 /.ofcsi-vm（hostPath 持久卷），
@@ -45,25 +52,33 @@ pub const VM_INIT_SCRIPT: &str = r#"#!/bin/sh
 set -eu
 BASE=/.ofcsi-vm
 DIRS="etc usr var opt root home srv"
+KEEP=/tmp/.ofcsi-keep
+TAB=$(printf '\t')
 
-# ── 防遮蔽检测 ──────────────────────────────────────────────
-# 白名单目录内的其他挂载点会被 overlay 遮蔽（kubelet 注入的
-# hosts/hostname/resolv.conf 除外，其内容已固化进 bind 视图）。
-# 发现即拒绝启动，绝不静默丢挂载。
+# ── 用户挂载排除 ────────────────────────────────────────────
+# 白名单目录下已存在的挂载点一律排除在 overlay 之外：先 bind 到容器私有
+# 中转位，overlay 挂好后按浅→深 bind 回原路径（mount 树上后挂的在顶层，
+# 用户的挂载完好地浮在 overlay 之上）。用户挂载 = 用户显式声明这份数据
+# 归自己的卷管，程序不接管、不遮蔽。
+rm -rf "$KEEP"
+mkdir -p "$KEEP"
+: > "$KEEP/submounts"
 for d in $DIRS; do
-  bad=$(awk -v pre="/$d/" 'index($5, pre) == 1 {print $5}' /proc/self/mountinfo \
-        | grep -Ev '^/etc/(hosts|hostname|resolv\.conf)$' || true)
-  if [ -n "$bad" ]; then
-    echo "ofcsi-vm: mount points inside /$d would be shadowed by the persistent overlay:" >&2
-    echo "$bad" >&2
-    echo "ofcsi-vm: move them out of system dirs, or remove the overlayfs.csi.k8s.io/max-age-s annotation" >&2
-    exit 1
-  fi
+  # 第 1 列 = 挂载点路径的斜杠深度；浅→深排序保证 bind 回时父路径先就位
+  awk -v pre="/$d/" 'index($5, pre) == 1 { n = gsub(/\//, "/", $5); print n "\t" $5 }' \
+    /proc/self/mountinfo >> "$KEEP/submounts"
 done
+sort -n -u "$KEEP/submounts" -o "$KEEP/submounts"
+: > "$KEEP/bindings"
+i=0
+while IFS="$TAB" read -r _ m; do
+  i=$((i + 1))
+  if [ -f "$m" ]; then : > "$KEEP/$i"; else mkdir -p "$KEEP/$i"; fi
+  mount --bind "$m" "$KEEP/$i"
+  printf '%s\t%s\n' "$i" "$m" >> "$KEEP/bindings"
+done < "$KEEP/submounts"
 
-# ── kubelet 注入的三个文件以本次 pod 为准 ─────────────────────
-# 上次运行若把它们写进了快照 upper，会遮蔽 kubelet 为本次 pod 准备的版本
-# （hostname/hosts/resolv.conf 随 pod 变化，必须跟随新 pod）。
+# ── 上次运行写进快照的 kubelet 注入文件清理（防快照膨胀）──────
 mkdir -p "$BASE/up/etc"
 rm -f "$BASE/up/etc/hosts" "$BASE/up/etc/hostname" "$BASE/up/etc/resolv.conf"
 
@@ -78,6 +93,12 @@ for d in $DIRS; do
     -o "lowerdir=$BASE/bind/$d,upperdir=$BASE/up/$d,workdir=$BASE/work/$d" \
     "/$d"
 done
+
+# ── 排除的挂载点按浅→深 bind 回原路径 ─────────────────────────
+while IFS="$TAB" read -r i m; do
+  [ -e "$m" ] || { if [ -f "$KEEP/$i" ]; then : > "$m"; else mkdir -p "$m"; fi; }
+  mount --bind "$KEEP/$i" "$m"
+done < "$KEEP/bindings"
 
 # ── 执行原命令 ──────────────────────────────────────────────
 [ "$#" -ge 1 ] || { echo "ofcsi-vm: no command to exec" >&2; exit 1; }
@@ -782,6 +803,65 @@ mod tests {
         );
         assert!(!dir.join("mnt/b.txt").exists(), "whiteout 必须跨重建生效");
         umount();
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 用户挂载排除（vm-init.sh 三阶段的内核行为验证）：白名单目录下的用户
+    /// 挂载在 overlay 之上完好保留——写入直达用户卷（不进快照），而 overlay
+    /// 的持久化照常工作；跨「pod 重建」（拆栈重挂）两边语义都保持。
+    #[test]
+    fn submounts_are_excluded_from_snapshot() {
+        if !require_root() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ofcsi-vm-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in [
+            "lower/usr", "up/usr", "work/usr", "bind/usr", "mnt/usr", "real-data", "tmp-keep",
+        ] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::write(dir.join("lower/usr/app.txt"), "image").unwrap();
+        std::fs::write(dir.join("real-data/hostfile"), "user-data").unwrap();
+
+        let sh = |cmd: &str| {
+            let out = duct::cmd!("sh", "-c", cmd).dir(&dir).run().expect("sh failed");
+            assert!(out.status.success(), "{cmd} failed: {}", String::from_utf8_lossy(&out.stderr));
+        };
+
+        let stack = || {
+            // 模拟 kubelet 挂用户卷到白名单目录下，随后三阶段：排除 → overlay → bind 回
+            sh("mount --bind real-data mnt/usr/keepme");
+            sh("mount --bind mnt/usr/keepme tmp-keep");
+            sh("mount --bind lower bind && mount -t overlay overlay -o lowerdir=bind,upperdir=up,workdir=work mnt/usr");
+            sh("mount --bind tmp-keep mnt/usr/keepme");
+        };
+        let unstack = || {
+            sh("umount mnt/usr/keepme && umount mnt/usr && umount bind && umount mnt/usr/keepme");
+        };
+
+        // 第一次「pod 启动」
+        stack();
+        // 用户数据写进用户卷，不进快照
+        std::fs::write(dir.join("mnt/usr/keepme/newfile"), "user").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("real-data/newfile")).unwrap(), "user");
+        assert!(!dir.join("up/usr/keepme").exists(), "用户挂载不得泄漏进快照");
+        // overlay 持久化照常工作
+        std::fs::write(dir.join("mnt/usr/written.txt"), "persisted").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("up/usr/written.txt")).unwrap(), "persisted");
+        unstack();
+
+        // 第二次「pod 删除重建」：用户卷重新挂载 + 三阶段重跑
+        stack();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("mnt/usr/keepme/newfile")).unwrap(),
+            "user",
+            "用户卷数据跨重建保留（走用户卷，与普通 pod 一致）"
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("mnt/usr/written.txt")).unwrap(), "persisted");
+        assert_eq!(std::fs::read_to_string(dir.join("mnt/usr/app.txt")).unwrap(), "image");
+        unstack();
 
         std::fs::remove_dir_all(&dir).ok();
     }
