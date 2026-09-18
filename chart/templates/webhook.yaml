@@ -43,59 +43,10 @@ spec:
     - port: {{ .Values.webhook.port }}
       targetPort: {{ .Values.webhook.port }}
 ---
-# vm-init.sh 注入到每个 VM pod（ConfigMap 只读挂载 /.ofcsi-vm-bin）。
-# 名字与 src/webhook.rs 的 VM_CONFIGMAP 常量保持一致。
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: "{{ .Values.webhook.configMapName }}"
-  namespace: "{{ .Values.namespace }}"
-data:
-  vm-init.sh: |
-    #!/bin/sh
-    # overlayfs-csi VM 模式容器入口：把白名单系统目录叠上「持久 upperdir」的
-    # overlay 后 exec 原命令。写入直接落在 /.ofcsi-vm（hostPath 持久卷），
-    # pod 删除重建后修改原样回来——写时持久，没有退出写回步骤。
-    set -eu
-    BASE=/.ofcsi-vm
-    DIRS="etc usr var opt root home srv"
-
-    # ── 防遮蔽检测 ──────────────────────────────────────────────
-    # 白名单目录内的其他挂载点会被 overlay 遮蔽（kubelet 注入的
-    # hosts/hostname/resolv.conf 除外，其内容已固化进 bind 视图）。
-    # 发现即拒绝启动，绝不静默丢挂载。
-    for d in $DIRS; do
-      bad=$(awk -v pre="/$d/" 'index($5, pre) == 1 {print $5}' /proc/self/mountinfo \
-            | grep -Ev '^/etc/(hosts|hostname|resolv\.conf)$' || true)
-      if [ -n "$bad" ]; then
-        echo "ofcsi-vm: mount points inside /$d would be shadowed by the persistent overlay:" >&2
-        echo "$bad" >&2
-        echo "ofcsi-vm: move them out of system dirs, or remove the overlayfs.csi.k8s.io/max-age-s annotation" >&2
-        exit 1
-      fi
-    done
-
-    # ── kubelet 注入的三个文件以本次 pod 为准 ─────────────────────
-    # 上次运行若把它们写进了快照 upper，会遮蔽 kubelet 为本次 pod 准备的版本
-    # （hostname/hosts/resolv.conf 随 pod 变化，必须跟随新 pod）。
-    mkdir -p "$BASE/up/etc"
-    rm -f "$BASE/up/etc/hosts" "$BASE/up/etc/hostname" "$BASE/up/etc/resolv.conf"
-
-    # ── bind 固定镜像目录 + 自叠加 overlay ────────────────────────
-    # 先 bind（固定挂载前的镜像内容），再以 bind 路径为 lowerdir 挂回原目录：
-    # 直接以 /$d 作 lowerdir 会触发 overlayfs 的路径重叠检查。
-    for d in $DIRS; do
-      [ -d "/$d" ] || continue
-      mkdir -p "$BASE/bind/$d" "$BASE/up/$d" "$BASE/work/$d"
-      mount --bind "/$d" "$BASE/bind/$d"
-      mount -t overlay overlay \
-        -o "lowerdir=$BASE/bind/$d,upperdir=$BASE/up/$d,workdir=$BASE/work/$d" \
-        "/$d"
-    done
-
-    # ── 执行原命令 ──────────────────────────────────────────────
-    [ "$#" -ge 1 ] || { echo "ofcsi-vm: no command to exec" >&2; exit 1; }
-    exec "$@"
+# vm-init.sh 不再走 ConfigMap：webhook 把脚本直接写进每份快照卷根
+# （<storageRoot>/vm/<ns>/<pod>/vm-init.sh），随 hostPath 卷挂载进容器。
+# ConfigMap 是 namespace 域资源，曾导致其他 namespace 的 VM pod
+# 卡在 FailedMount（configmap not found）；见 src/webhook.rs::VM_INIT_SCRIPT。
 ---
 # failurePolicy: Ignore——webhook 停机不得拖累普通 pod 创建；带注解的 pod 会被
 # controller 的 vm_gc_once 兜底删除重建（静默不持久 = 数据丢失，绝不放行）。

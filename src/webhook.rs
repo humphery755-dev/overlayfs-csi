@@ -24,20 +24,65 @@ use crate::base::Store;
 use crate::controller::MAX_AGE_ANNOTATION;
 
 pub const VM_VOLUME_NAME: &str = "ofcsi-vm";
-pub const VM_BIN_VOLUME_NAME: &str = "ofcsi-vm-bin";
-/// hostPath 快照卷在容器内的挂载点（wrapper 由此读写持久 upper/work/bind）
+/// hostPath 快照卷在容器内的挂载点；wrapper 脚本也随卷分发（写在卷根）
 pub const VM_DIR: &str = "/.ofcsi-vm";
-/// wrapper 脚本 ConfigMap 的只读挂载点
-pub const VM_BIN_DIR: &str = "/.ofcsi-vm-bin";
-pub const VM_INIT: &str = "/.ofcsi-vm-bin/vm-init.sh";
-/// vm-init.sh 所在 ConfigMap 名；与 chart/templates/webhook.yaml 保持一致（驱动与
-/// ConfigMap 同 namespace 单实例部署）
-pub const VM_CONFIGMAP: &str = "overlayfs-csi-vm-init";
+/// wrapper 脚本：由 [`ensure_vm_dir`] 写进快照卷根，随 hostPath 卷挂载进容器。
+/// 不走 ConfigMap——ConfigMap 是 namespace 域资源，会让其他 namespace 的 VM pod
+/// 卡在 FailedMount（「任意 namespace 打注解即用」是 VM 模式的硬承诺）。
+pub const VM_INIT: &str = "/.ofcsi-vm/vm-init.sh";
 /// 注入成功标记：watcher 兜底检测依据——带 VM 注解却没有本标记 = webhook 失效期
 /// 建成的 pod（静默不持久 = 数据丢失风险），删除重建。
 pub const VM_INJECTED_ANNOTATION: &str = "overlayfs.csi.k8s.io/vm-injected";
 
 pub const META_FILE: &str = "meta.json";
+
+/// vm-init.sh 全文：随快照卷分发（[`ensure_vm_dir`] 落盘），每次注入都重写——
+/// 驱动升级后新注入的 pod 自动用上新脚本。
+pub const VM_INIT_SCRIPT: &str = r#"#!/bin/sh
+# overlayfs-csi VM 模式容器入口：把白名单系统目录叠上「持久 upperdir」的
+# overlay 后 exec 原命令。写入直接落在 /.ofcsi-vm（hostPath 持久卷），
+# pod 删除重建后修改原样回来——写时持久，没有退出写回步骤。
+set -eu
+BASE=/.ofcsi-vm
+DIRS="etc usr var opt root home srv"
+
+# ── 防遮蔽检测 ──────────────────────────────────────────────
+# 白名单目录内的其他挂载点会被 overlay 遮蔽（kubelet 注入的
+# hosts/hostname/resolv.conf 除外，其内容已固化进 bind 视图）。
+# 发现即拒绝启动，绝不静默丢挂载。
+for d in $DIRS; do
+  bad=$(awk -v pre="/$d/" 'index($5, pre) == 1 {print $5}' /proc/self/mountinfo \
+        | grep -Ev '^/etc/(hosts|hostname|resolv\.conf)$' || true)
+  if [ -n "$bad" ]; then
+    echo "ofcsi-vm: mount points inside /$d would be shadowed by the persistent overlay:" >&2
+    echo "$bad" >&2
+    echo "ofcsi-vm: move them out of system dirs, or remove the overlayfs.csi.k8s.io/max-age-s annotation" >&2
+    exit 1
+  fi
+done
+
+# ── kubelet 注入的三个文件以本次 pod 为准 ─────────────────────
+# 上次运行若把它们写进了快照 upper，会遮蔽 kubelet 为本次 pod 准备的版本
+# （hostname/hosts/resolv.conf 随 pod 变化，必须跟随新 pod）。
+mkdir -p "$BASE/up/etc"
+rm -f "$BASE/up/etc/hosts" "$BASE/up/etc/hostname" "$BASE/up/etc/resolv.conf"
+
+# ── bind 固定镜像目录 + 自叠加 overlay ────────────────────────
+# 先 bind（固定挂载前的镜像内容），再以 bind 路径为 lowerdir 挂回原目录：
+# 直接以 /$d 作 lowerdir 会触发 overlayfs 的路径重叠检查。
+for d in $DIRS; do
+  [ -d "/$d" ] || continue
+  mkdir -p "$BASE/bind/$d" "$BASE/up/$d" "$BASE/work/$d"
+  mount --bind "/$d" "$BASE/bind/$d"
+  mount -t overlay overlay \
+    -o "lowerdir=$BASE/bind/$d,upperdir=$BASE/up/$d,workdir=$BASE/work/$d" \
+    "/$d"
+done
+
+# ── 执行原命令 ──────────────────────────────────────────────
+[ "$#" -ge 1 ] || { echo "ofcsi-vm: no command to exec" >&2; exit 1; }
+exec "$@"
+"#;
 
 /// meta.json：GC 唯一依据。webhook 注入时写 ttl_s（取自 pod 注解）；GC 循环对活跃
 /// VM 刷新 last_seen；目录失去活跃 pod 后从 last_seen 起 TTL 过期才删除。
@@ -155,6 +200,8 @@ pub fn ensure_vm_dir(
     for sub in ["up", "work", "bind"] {
         std::fs::create_dir_all(dir.join(sub))?;
     }
+    // wrapper 随卷分发：每次注入都重写，驱动升级后新 pod 自动用上新脚本
+    std::fs::write(dir.join("vm-init.sh"), VM_INIT_SCRIPT)?;
     write_meta(&dir, &VmMeta { ttl_s, last_seen: now_unix() })?;
     Ok(dir)
 }
@@ -188,7 +235,6 @@ fn container_patches(
 
     let mounts = json!([
         {"name": VM_VOLUME_NAME, "mountPath": VM_DIR},
-        {"name": VM_BIN_VOLUME_NAME, "mountPath": VM_BIN_DIR, "readOnly": true},
     ]);
     if c.volume_mounts.is_some() {
         for m in mounts.as_array().expect("mounts is an array") {
@@ -219,7 +265,6 @@ pub fn injection_patches(pod: &Pod, namespace: &str, store: &Store) -> Result<Ve
     let snapshot_dir = store.vm_dir(namespace, &name);
     let volumes = json!([
         {"name": VM_VOLUME_NAME, "hostPath": {"path": snapshot_dir.display().to_string(), "type": "DirectoryOrCreate"}},
-        {"name": VM_BIN_VOLUME_NAME, "configMap": {"name": VM_CONFIGMAP}},
     ]);
 
     let mut patches = Vec::new();
@@ -494,17 +539,23 @@ mod tests {
         let patches = injection_patches(&pod, "kube-system", &store).unwrap();
         let text = serde_json::to_string(&patches).unwrap();
 
-        // pod 级：两个 volume + hostPath 指向 ns/name 快照目录
+        // pod 级：hostPath 卷指向 ns/name 快照目录（无 ConfigMap——脚本随卷分发）
         assert!(text.contains(r#""path":"/spec/volumes""#));
         assert!(text.contains(VM_VOLUME_NAME));
         assert!(text.contains("/var/lib/overlayfs-csi/vm/kube-system/test"));
-        assert!(text.contains(VM_CONFIGMAP));
+        assert!(
+            !text.contains("configMap"),
+            "注入不得再引用 ConfigMap（namespace 域，跨 ns 必挂）"
+        );
 
-        // 容器级：command 包 wrapper、privileged、双挂载
+        // 容器级：command 包 wrapper、privileged、单卷挂载
         assert!(text.contains(VM_INIT));
         assert!(text.contains(r#""privileged":true"#));
         assert!(text.contains(VM_DIR));
-        assert!(text.contains(VM_BIN_DIR));
+        assert!(
+            !text.contains("/.ofcsi-vm-bin"),
+            "旧的 bin 卷挂载点必须移除"
+        );
         let wrapped: Vec<&Value> = patches
             .iter()
             .filter(|p| p["path"].as_str() == Some("/spec/containers/0/command"))
@@ -641,6 +692,10 @@ mod tests {
         for sub in ["up", "work", "bind"] {
             assert!(dir.join(sub).is_dir(), "{sub} 必须存在");
         }
+        // wrapper 随卷分发：脚本必须落盘且可执行内容完整
+        let script = std::fs::read_to_string(dir.join("vm-init.sh")).unwrap();
+        assert!(script.starts_with("#!/bin/sh"), "脚本必须有 shebang");
+        assert!(script.contains("mount -t overlay"), "脚本必须包含 overlay 挂载");
         assert_eq!(
             read_meta(&dir).unwrap().map(|m| m.ttl_s),
             Some(60)

@@ -20,5 +20,3 @@ maxAgeSeconds: 2592000
 webhook:
   enabled: true
   port: 9443
-  # vm-init.sh 所在 ConfigMap 名；勿改（src/webhook.rs::VM_CONFIGMAP 与此对应）
-  configMapName: overlayfs-csi-vm-init
