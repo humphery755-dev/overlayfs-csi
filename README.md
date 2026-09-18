@@ -12,7 +12,7 @@ This repository also provides an example for building Kubernetes CSIs in Rust.
 
 ## Usage
 
-- Volumes are requested as standalone [PVCs](https://kubernetes.io/docs/concepts/storage/persistent-volumes/) using this driver's StorageClass, and mounted through a `persistentVolumeClaim` reference (see [`pod.yaml`](pod.yaml) for a complete example):
+- Volumes are requested as standalone [PVCs](https://kubernetes.io/docs/concepts/storage/persistent-volumes/) using this driver's StorageClass, and mounted through a `persistentVolumeClaim` reference (see [`examples/pod.yaml`](examples/pod.yaml) for a complete example):
 
   ```yaml
   apiVersion: v1
@@ -123,18 +123,18 @@ It would be fairly easy to support arbitrary volume types. For CSIs that support
    $ helm install overlayfs-csi chart
    ```
 
-To test the deployment, apply [`pod.yaml`](pod.yaml), which creates a PVC and a pod mounting it at `/test` (both in the `kube-system` namespace, matching the chart default):
+To test the deployment, apply [`examples/pod.yaml`](examples/pod.yaml), which creates a PVC and a pod mounting it at `/test` (both in the `kube-system` namespace, matching the chart default):
 
-1. Apply the example (the namespace already exists in most clusters; adjust it in `pod.yaml` if yours differs)
+1. Apply the example (the namespace already exists in most clusters; adjust it in `examples/pod.yaml` if yours differs)
    ```
-   $ kubectl apply -f pod.yaml
+   $ kubectl apply -f examples/pod.yaml
    ```
 2. Write some data and mark the volume as base material
    ```
    $ kubectl exec test -- touch /test/hello
    $ kubectl exec test -- touch /test/.as_base
    ```
-3. Delete the pod, then apply `pod.yaml` again: the pod remounts the same PVC and the data is still there.
+3. Delete the pod, then apply `examples/pod.yaml` again: the pod remounts the same PVC and the data is still there.
    ```
    $ kubectl exec test -- ls /test
    hello
@@ -148,8 +148,8 @@ To test the deployment, apply [`pod.yaml`](pod.yaml), which creates a PVC and a 
 The same example survives arbitrarily long downtime — only the pod is deleted, the PVC (and with it the data directory on the node) stays:
 
 ```
-$ kubectl delete pod test        # pod only — never `kubectl delete -f pod.yaml`, that would delete the PVC too
-$ kubectl apply -f pod.yaml      # days later: same PVC reused, all changes are still there
+$ kubectl delete pod test        # pod only — never `kubectl delete -f examples/pod.yaml`, that would delete the PVC too
+$ kubectl apply -f examples/pod.yaml      # days later: same PVC reused, all changes are still there
 ```
 
 `maxAgeSeconds` controls how long the _full_ environment (base + your changes) re-attaches after downtime; PVC data itself does not depend on it. Set it larger than your expected downtime interval (see [`chart/values.yaml`](chart/values.yaml)).

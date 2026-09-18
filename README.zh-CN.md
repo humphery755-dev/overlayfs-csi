@@ -12,7 +12,7 @@
 
 ## 使用方法
 
-- 卷以独立 [PVC](https://kubernetes.io/docs/concepts/storage/persistent-volumes/) 的形式申请（使用本驱动的 StorageClass），并通过 `persistentVolumeClaim` 引用挂载（完整示例见 [`pod.yaml`](pod.yaml)）：
+- 卷以独立 [PVC](https://kubernetes.io/docs/concepts/storage/persistent-volumes/) 的形式申请（使用本驱动的 StorageClass），并通过 `persistentVolumeClaim` 引用挂载（完整示例见 [`examples/pod.yaml`](examples/pod.yaml)）：
 
   ```yaml
   apiVersion: v1
@@ -123,18 +123,18 @@ chart 部署的 mutating webhook 在 Pod 创建时改写带注解的 Pod：
    $ helm install overlayfs-csi chart
    ```
 
-部署完成后可按如下方式验证——[`pod.yaml`](pod.yaml) 会创建 PVC 并启动一个挂载到 `/test` 的 Pod（均在 `kube-system` namespace，与 chart 默认一致）：
+部署完成后可按如下方式验证——[`examples/pod.yaml`](examples/pod.yaml) 会创建 PVC 并启动一个挂载到 `/test` 的 Pod（均在 `kube-system` namespace，与 chart 默认一致）：
 
-1. 应用示例（多数集群已存在该 namespace；不同请调整 `pod.yaml`）
+1. 应用示例（多数集群已存在该 namespace；不同请调整 `examples/pod.yaml`）
    ```
-   $ kubectl apply -f pod.yaml
+   $ kubectl apply -f examples/pod.yaml
    ```
 2. 写入数据并标记为 base 素材
    ```
    $ kubectl exec test -- touch /test/hello
    $ kubectl exec test -- touch /test/.as_base
    ```
-3. 删除 Pod 后再次 `kubectl apply -f pod.yaml`：Pod 重新挂载同一个 PVC，数据仍在。
+3. 删除 Pod 后再次 `kubectl apply -f examples/pod.yaml`：Pod 重新挂载同一个 PVC，数据仍在。
    ```
    $ kubectl exec test -- ls /test
    hello
@@ -148,8 +148,8 @@ chart 部署的 mutating webhook 在 Pod 创建时改写带注解的 Pod：
 同样的示例可以经受任意长的停机——被删除的只有 Pod，PVC（及其在节点上的数据目录）始终保留：
 
 ```
-$ kubectl delete pod test        # 只删 Pod —— 切勿 kubectl delete -f pod.yaml，那会连 PVC 一起删除
-$ kubectl apply -f pod.yaml      # 数天后：同名 PVC 复用，所有变更原样回来
+$ kubectl delete pod test        # 只删 Pod —— 切勿 kubectl delete -f examples/pod.yaml，那会连 PVC 一起删除
+$ kubectl apply -f examples/pod.yaml      # 数天后：同名 PVC 复用，所有变更原样回来
 ```
 
 `maxAgeSeconds` 决定停机后_完整_环境（base + 你的变更）能回粘多久；PVC 数据本身不依赖它。把它设置为大于预期停机间隔即可（见 [`chart/values.yaml`](chart/values.yaml)）。
